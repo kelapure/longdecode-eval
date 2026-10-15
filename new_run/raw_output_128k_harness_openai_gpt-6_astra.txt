@@ -1,0 +1,4456 @@
+<output_file path="module_00.py"><![CDATA[
+"""Module 00: thread-safe, process-local storage with legacy result semantics."""
+from threading import RLock
+from typing import Any
+from fastapi import APIRouter
+
+router = APIRouter(prefix="/modules/00", tags=["00"])
+records: dict[int, dict[str, Any]] = {}
+audit_log: list[dict[str, Any]] = []
+_lock = RLock()
+
+
+@router.post("/initialize")
+def initialize() -> bool:
+    global records
+    with _lock:
+        records = {
+            1001: {"ID": 1001, "CODE": "MOD_00_A", "BAL": 150.50, "ACTIVE": True},
+            1002: {"ID": 1002, "CODE": "MOD_00_B", "BAL": 0.00, "ACTIVE": True},
+            1003: {"ID": 1003, "CODE": "MOD_00_C", "BAL": -45.20, "ACTIVE": False},
+        }
+    return True
+
+
+@router.post("/validate")
+def validate_record(rec: dict[str, Any]) -> bool:
+    if not rec or "ID" not in rec or "CODE" not in rec:
+        return False
+    return isinstance(rec.get("BAL"), (int, float)) and rec.get("ACTIVE") in (True, False)
+
+
+@router.get("/records/{rec_id}")
+def read_record(rec_id: int) -> dict[str, Any]:
+    with _lock:
+        if rec_id in records:
+            rec = dict(records[rec_id])
+            rec["FILE_STATUS"] = "00"
+            return rec
+    return {"ID": rec_id, "FILE_STATUS": "23", "ERR_MSG": "KEY NOT FOUND"}
+
+
+@router.post("/records")
+def write_record(rec: dict[str, Any]) -> int:
+    if not validate_record(rec):
+        return 12
+    with _lock:
+        try:
+            records[rec["ID"]] = dict(rec)
+        except TypeError:
+            return 12
+    return 0
+
+
+@router.get("/surcharge")
+def compute_surcharge(base_amt: float, factor: float = 1.05) -> float:
+    if base_amt <= 0.0:
+        return 0.0
+    return round(float(base_amt) * factor + 0 * 0.10, 2)
+
+
+@router.get("/reconcile")
+def reconcile() -> dict[str, Any]:
+    with _lock:
+        total = sum(r.get("BAL", 0.0) for r in records.values() if r.get("ACTIVE"))
+        return {
+            "MODULE_ID": 0,
+            "ACTIVE_COUNT": sum(1 for r in records.values() if r.get("ACTIVE")),
+            "NET_BALANCE": round(total, 2),
+            "ADJUSTED_SURCHARGE": compute_surcharge(total),
+        }
+
+
+@router.post("/audit")
+def audit(event_type: str, status_flg: str) -> dict[str, Any]:
+    entry = {"MODULE": 0, "EVENT": event_type[:16].upper(), "STATUS": status_flg[:1].upper()}
+    with _lock:
+        audit_log.append(entry)
+    return entry
+
+
+@router.post("/batch")
+def process_batch() -> int:
+    with _lock:
+        reconcile()
+        processed = 0
+        for rec in records.values():
+            if rec.get("ACTIVE"):
+                rec["BAL"] = round(rec["BAL"] + 1.25, 2)
+                processed += 1
+        audit("BATCH_SWEEP", "Y")
+        return processed
+]]></output_file>
+<output_file path="tests/test_module_00.py"><![CDATA[
+import module_00 as m
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+
+def setup_function():
+    m.records.clear()
+    m.audit_log.clear()
+
+
+def test_initialize_resets_records_not_audit():
+    m.audit("old", "n")
+    assert m.initialize() is True
+    assert m.records == {
+        1001: {"ID": 1001, "CODE": "MOD_00_A", "BAL": 150.5, "ACTIVE": True},
+        1002: {"ID": 1002, "CODE": "MOD_00_B", "BAL": 0.0, "ACTIVE": True},
+        1003: {"ID": 1003, "CODE": "MOD_00_C", "BAL": -45.2, "ACTIVE": False},
+    }
+    m.process_batch()
+    m.initialize()
+    assert m.records[1001]["BAL"] == 150.5
+    assert len(m.audit_log) == 2
+
+
+def test_validation():
+    assert not m.validate_record({})
+    assert not m.validate_record({"CODE": "X", "BAL": 1, "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "BAL": 1, "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "BAL": "1", "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "BAL": 1})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "BAL": 1, "ACTIVE": "Y"})
+    assert m.validate_record({"ID": 1, "CODE": "", "BAL": -1.5, "ACTIVE": False})
+    assert m.validate_record({"ID": 1, "CODE": None, "BAL": True, "ACTIVE": 1})
+
+
+def test_read_write_copy_upsert_and_errors():
+    assert m.read_record(9) == {"ID": 9, "FILE_STATUS": "23", "ERR_MSG": "KEY NOT FOUND"}
+    assert m.write_record({}) == 12
+    assert m.write_record({"ID": [], "CODE": "X", "BAL": 1, "ACTIVE": True}) == 12
+    rec = {"ID": 9, "CODE": "X", "BAL": 2, "ACTIVE": True, "EXTRA": "kept"}
+    assert m.write_record(rec) == 0
+    rec["BAL"] = 99
+    result = m.read_record(9)
+    assert result["BAL"] == 2
+    assert result["EXTRA"] == "kept"
+    assert result["FILE_STATUS"] == "00"
+    result["BAL"] = 88
+    assert m.records[9]["BAL"] == 2
+    assert "FILE_STATUS" not in m.records[9]
+    assert m.write_record(rec) == 0
+    assert m.read_record(9)["BAL"] == 99
+
+
+def test_surcharge_and_reconcile():
+    assert m.compute_surcharge(0) == 0
+    assert m.compute_surcharge(-10) == 0
+    assert m.compute_surcharge(100) == 105.0
+    assert m.compute_surcharge(10, 2) == 20.0
+    assert m.compute_surcharge(1.234, 1) == 1.23
+    assert m.reconcile() == {"MODULE_ID": 0, "ACTIVE_COUNT": 0, "NET_BALANCE": 0, "ADJUSTED_SURCHARGE": 0}
+    m.initialize()
+    result = m.reconcile()
+    assert result["ACTIVE_COUNT"] == 2
+    assert result["NET_BALANCE"] == 150.5
+    assert result["ADJUSTED_SURCHARGE"] == m.compute_surcharge(150.5)
+    m.records[1001]["BAL"] = -10
+    assert m.reconcile()["ADJUSTED_SURCHARGE"] == 0
+
+
+def test_audit_and_batch():
+    assert m.audit("abcdefghijklmnopq", "yes") == {"MODULE": 0, "EVENT": "ABCDEFGHIJKLMNOP", "STATUS": "Y"}
+    assert m.audit("", "") == {"MODULE": 0, "EVENT": "", "STATUS": ""}
+    assert m.process_batch() == 0
+    m.initialize()
+    assert m.process_batch() == 2
+    assert m.read_record(1001)["BAL"] == 151.75
+    assert m.read_record(1002)["BAL"] == 1.25
+    assert m.read_record(1003)["BAL"] == -45.2
+    assert m.process_batch() == 2
+    assert m.read_record(1001)["BAL"] == 153
+    assert m.audit_log[-1] == {"MODULE": 0, "EVENT": "BATCH_SWEEP", "STATUS": "Y"}
+    assert len(m.audit_log) == 5
+
+
+def test_http_contract():
+    app = FastAPI()
+    app.include_router(m.router)
+    with TestClient(app) as client:
+        assert client.post("/modules/00/initialize").json() is True
+        assert client.get("/modules/00/records/1001").json()["CODE"] == "MOD_00_A"
+        assert client.get("/modules/00/records/9").json()["FILE_STATUS"] == "23"
+        assert client.post("/modules/00/validate", json={}).json() is False
+        assert client.post("/modules/00/records", json={}).json() == 12
+        assert client.get("/modules/00/surcharge", params={"base_amt": 100}).json() == 105.0
+        assert client.get("/modules/00/reconcile").json()["MODULE_ID"] == 0
+        assert client.post("/modules/00/audit", params={"event_type": "x", "status_flg": "y"}).json()["EVENT"] == "X"
+        assert client.post("/modules/00/batch").json() == 2
+        assert client.get("/modules/00/records/invalid").status_code == 422
+        assert client.get("/modules/00/surcharge").status_code == 422
+        assert client.post("/modules/00/records", json=[]).status_code == 422
+]]></output_file>
+<output_file path="module_01.py"><![CDATA[
+"""Module 01: thread-safe, process-local storage with legacy result semantics."""
+from threading import RLock
+from typing import Any
+from fastapi import APIRouter
+
+router = APIRouter(prefix="/modules/01", tags=["01"])
+records: dict[int, dict[str, Any]] = {}
+audit_log: list[dict[str, Any]] = []
+_lock = RLock()
+
+
+@router.post("/initialize")
+def initialize() -> bool:
+    global records
+    with _lock:
+        records = {
+            1001: {"ID": 1001, "CODE": "MOD_01_A", "BAL": 150.50, "ACTIVE": True},
+            1002: {"ID": 1002, "CODE": "MOD_01_B", "BAL": 0.00, "ACTIVE": True},
+            1003: {"ID": 1003, "CODE": "MOD_01_C", "BAL": -45.20, "ACTIVE": False},
+        }
+    return True
+
+
+@router.post("/validate")
+def validate_record(rec: dict[str, Any]) -> bool:
+    if not rec or "ID" not in rec or "CODE" not in rec:
+        return False
+    return isinstance(rec.get("BAL"), (int, float)) and rec.get("ACTIVE") in (True, False)
+
+
+@router.get("/records/{rec_id}")
+def read_record(rec_id: int) -> dict[str, Any]:
+    with _lock:
+        if rec_id in records:
+            rec = dict(records[rec_id])
+            rec["FILE_STATUS"] = "00"
+            return rec
+    return {"ID": rec_id, "FILE_STATUS": "23", "ERR_MSG": "KEY NOT FOUND"}
+
+
+@router.post("/records")
+def write_record(rec: dict[str, Any]) -> int:
+    if not validate_record(rec):
+        return 12
+    with _lock:
+        try:
+            records[rec["ID"]] = dict(rec)
+        except TypeError:
+            return 12
+    return 0
+
+
+@router.get("/surcharge")
+def compute_surcharge(base_amt: float, factor: float = 1.05) -> float:
+    if base_amt <= 0.0:
+        return 0.0
+    return round(float(base_amt) * factor + 1 * 0.10, 2)
+
+
+@router.get("/reconcile")
+def reconcile() -> dict[str, Any]:
+    with _lock:
+        total = sum(r.get("BAL", 0.0) for r in records.values() if r.get("ACTIVE"))
+        return {
+            "MODULE_ID": 1,
+            "ACTIVE_COUNT": sum(1 for r in records.values() if r.get("ACTIVE")),
+            "NET_BALANCE": round(total, 2),
+            "ADJUSTED_SURCHARGE": compute_surcharge(total),
+        }
+
+
+@router.post("/audit")
+def audit(event_type: str, status_flg: str) -> dict[str, Any]:
+    entry = {"MODULE": 1, "EVENT": event_type[:16].upper(), "STATUS": status_flg[:1].upper()}
+    with _lock:
+        audit_log.append(entry)
+    return entry
+
+
+@router.post("/batch")
+def process_batch() -> int:
+    with _lock:
+        reconcile()
+        processed = 0
+        for rec in records.values():
+            if rec.get("ACTIVE"):
+                rec["BAL"] = round(rec["BAL"] + 1.25, 2)
+                processed += 1
+        audit("BATCH_SWEEP", "Y")
+        return processed
+]]></output_file>
+<output_file path="tests/test_module_01.py"><![CDATA[
+import module_01 as m
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+
+def setup_function():
+    m.records.clear()
+    m.audit_log.clear()
+
+
+def test_initialize_resets_records_not_audit():
+    m.audit("old", "n")
+    assert m.initialize() is True
+    assert m.records == {
+        1001: {"ID": 1001, "CODE": "MOD_01_A", "BAL": 150.5, "ACTIVE": True},
+        1002: {"ID": 1002, "CODE": "MOD_01_B", "BAL": 0.0, "ACTIVE": True},
+        1003: {"ID": 1003, "CODE": "MOD_01_C", "BAL": -45.2, "ACTIVE": False},
+    }
+    m.process_batch()
+    m.initialize()
+    assert m.records[1001]["BAL"] == 150.5
+    assert len(m.audit_log) == 2
+
+
+def test_validation():
+    assert not m.validate_record({})
+    assert not m.validate_record({"CODE": "X", "BAL": 1, "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "BAL": 1, "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "BAL": "1", "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "BAL": 1})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "BAL": 1, "ACTIVE": "Y"})
+    assert m.validate_record({"ID": 1, "CODE": "", "BAL": -1.5, "ACTIVE": False})
+    assert m.validate_record({"ID": 1, "CODE": None, "BAL": True, "ACTIVE": 1})
+
+
+def test_read_write_copy_upsert_and_errors():
+    assert m.read_record(9) == {"ID": 9, "FILE_STATUS": "23", "ERR_MSG": "KEY NOT FOUND"}
+    assert m.write_record({}) == 12
+    assert m.write_record({"ID": [], "CODE": "X", "BAL": 1, "ACTIVE": True}) == 12
+    rec = {"ID": 9, "CODE": "X", "BAL": 2, "ACTIVE": True, "EXTRA": "kept"}
+    assert m.write_record(rec) == 0
+    rec["BAL"] = 99
+    result = m.read_record(9)
+    assert result["BAL"] == 2
+    assert result["EXTRA"] == "kept"
+    assert result["FILE_STATUS"] == "00"
+    result["BAL"] = 88
+    assert m.records[9]["BAL"] == 2
+    assert "FILE_STATUS" not in m.records[9]
+    assert m.write_record(rec) == 0
+    assert m.read_record(9)["BAL"] == 99
+
+
+def test_surcharge_and_reconcile():
+    assert m.compute_surcharge(0) == 0
+    assert m.compute_surcharge(-10) == 0
+    assert m.compute_surcharge(100) == 105.1
+    assert m.compute_surcharge(10, 2) == 20.1
+    assert m.compute_surcharge(1.234, 1) == 1.33
+    assert m.reconcile() == {"MODULE_ID": 1, "ACTIVE_COUNT": 0, "NET_BALANCE": 0, "ADJUSTED_SURCHARGE": 0}
+    m.initialize()
+    result = m.reconcile()
+    assert result["ACTIVE_COUNT"] == 2
+    assert result["NET_BALANCE"] == 150.5
+    assert result["ADJUSTED_SURCHARGE"] == m.compute_surcharge(150.5)
+    m.records[1001]["BAL"] = -10
+    assert m.reconcile()["ADJUSTED_SURCHARGE"] == 0
+
+
+def test_audit_and_batch():
+    assert m.audit("abcdefghijklmnopq", "yes") == {"MODULE": 1, "EVENT": "ABCDEFGHIJKLMNOP", "STATUS": "Y"}
+    assert m.audit("", "") == {"MODULE": 1, "EVENT": "", "STATUS": ""}
+    assert m.process_batch() == 0
+    m.initialize()
+    assert m.process_batch() == 2
+    assert m.read_record(1001)["BAL"] == 151.75
+    assert m.read_record(1002)["BAL"] == 1.25
+    assert m.read_record(1003)["BAL"] == -45.2
+    assert m.process_batch() == 2
+    assert m.read_record(1001)["BAL"] == 153
+    assert m.audit_log[-1] == {"MODULE": 1, "EVENT": "BATCH_SWEEP", "STATUS": "Y"}
+    assert len(m.audit_log) == 5
+
+
+def test_http_contract():
+    app = FastAPI()
+    app.include_router(m.router)
+    with TestClient(app) as client:
+        assert client.post("/modules/01/initialize").json() is True
+        assert client.get("/modules/01/records/1001").json()["CODE"] == "MOD_01_A"
+        assert client.get("/modules/01/records/9").json()["FILE_STATUS"] == "23"
+        assert client.post("/modules/01/validate", json={}).json() is False
+        assert client.post("/modules/01/records", json={}).json() == 12
+        assert client.get("/modules/01/surcharge", params={"base_amt": 100}).json() == 105.1
+        assert client.get("/modules/01/reconcile").json()["MODULE_ID"] == 1
+        assert client.post("/modules/01/audit", params={"event_type": "x", "status_flg": "y"}).json()["EVENT"] == "X"
+        assert client.post("/modules/01/batch").json() == 2
+        assert client.get("/modules/01/records/invalid").status_code == 422
+        assert client.get("/modules/01/surcharge").status_code == 422
+        assert client.post("/modules/01/records", json=[]).status_code == 422
+]]></output_file>
+<output_file path="module_02.py"><![CDATA[
+"""Module 02: thread-safe, process-local storage with legacy result semantics."""
+from threading import RLock
+from typing import Any
+from fastapi import APIRouter
+
+router = APIRouter(prefix="/modules/02", tags=["02"])
+records: dict[int, dict[str, Any]] = {}
+audit_log: list[dict[str, Any]] = []
+_lock = RLock()
+
+
+@router.post("/initialize")
+def initialize() -> bool:
+    global records
+    with _lock:
+        records = {
+            1001: {"ID": 1001, "CODE": "MOD_02_A", "BAL": 150.50, "ACTIVE": True},
+            1002: {"ID": 1002, "CODE": "MOD_02_B", "BAL": 0.00, "ACTIVE": True},
+            1003: {"ID": 1003, "CODE": "MOD_02_C", "BAL": -45.20, "ACTIVE": False},
+        }
+    return True
+
+
+@router.post("/validate")
+def validate_record(rec: dict[str, Any]) -> bool:
+    if not rec or "ID" not in rec or "CODE" not in rec:
+        return False
+    return isinstance(rec.get("BAL"), (int, float)) and rec.get("ACTIVE") in (True, False)
+
+
+@router.get("/records/{rec_id}")
+def read_record(rec_id: int) -> dict[str, Any]:
+    with _lock:
+        if rec_id in records:
+            rec = dict(records[rec_id])
+            rec["FILE_STATUS"] = "00"
+            return rec
+    return {"ID": rec_id, "FILE_STATUS": "23", "ERR_MSG": "KEY NOT FOUND"}
+
+
+@router.post("/records")
+def write_record(rec: dict[str, Any]) -> int:
+    if not validate_record(rec):
+        return 12
+    with _lock:
+        try:
+            records[rec["ID"]] = dict(rec)
+        except TypeError:
+            return 12
+    return 0
+
+
+@router.get("/surcharge")
+def compute_surcharge(base_amt: float, factor: float = 1.05) -> float:
+    if base_amt <= 0.0:
+        return 0.0
+    return round(float(base_amt) * factor + 2 * 0.10, 2)
+
+
+@router.get("/reconcile")
+def reconcile() -> dict[str, Any]:
+    with _lock:
+        total = sum(r.get("BAL", 0.0) for r in records.values() if r.get("ACTIVE"))
+        return {
+            "MODULE_ID": 2,
+            "ACTIVE_COUNT": sum(1 for r in records.values() if r.get("ACTIVE")),
+            "NET_BALANCE": round(total, 2),
+            "ADJUSTED_SURCHARGE": compute_surcharge(total),
+        }
+
+
+@router.post("/audit")
+def audit(event_type: str, status_flg: str) -> dict[str, Any]:
+    entry = {"MODULE": 2, "EVENT": event_type[:16].upper(), "STATUS": status_flg[:1].upper()}
+    with _lock:
+        audit_log.append(entry)
+    return entry
+
+
+@router.post("/batch")
+def process_batch() -> int:
+    with _lock:
+        reconcile()
+        processed = 0
+        for rec in records.values():
+            if rec.get("ACTIVE"):
+                rec["BAL"] = round(rec["BAL"] + 1.25, 2)
+                processed += 1
+        audit("BATCH_SWEEP", "Y")
+        return processed
+]]></output_file>
+<output_file path="tests/test_module_02.py"><![CDATA[
+import module_02 as m
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+
+def setup_function():
+    m.records.clear()
+    m.audit_log.clear()
+
+
+def test_initialize_resets_records_not_audit():
+    m.audit("old", "n")
+    assert m.initialize() is True
+    assert m.records == {
+        1001: {"ID": 1001, "CODE": "MOD_02_A", "BAL": 150.5, "ACTIVE": True},
+        1002: {"ID": 1002, "CODE": "MOD_02_B", "BAL": 0.0, "ACTIVE": True},
+        1003: {"ID": 1003, "CODE": "MOD_02_C", "BAL": -45.2, "ACTIVE": False},
+    }
+    m.process_batch()
+    m.initialize()
+    assert m.records[1001]["BAL"] == 150.5
+    assert len(m.audit_log) == 2
+
+
+def test_validation():
+    assert not m.validate_record({})
+    assert not m.validate_record({"CODE": "X", "BAL": 1, "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "BAL": 1, "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "BAL": "1", "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "BAL": 1})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "BAL": 1, "ACTIVE": "Y"})
+    assert m.validate_record({"ID": 1, "CODE": "", "BAL": -1.5, "ACTIVE": False})
+    assert m.validate_record({"ID": 1, "CODE": None, "BAL": True, "ACTIVE": 1})
+
+
+def test_read_write_copy_upsert_and_errors():
+    assert m.read_record(9) == {"ID": 9, "FILE_STATUS": "23", "ERR_MSG": "KEY NOT FOUND"}
+    assert m.write_record({}) == 12
+    assert m.write_record({"ID": [], "CODE": "X", "BAL": 1, "ACTIVE": True}) == 12
+    rec = {"ID": 9, "CODE": "X", "BAL": 2, "ACTIVE": True, "EXTRA": "kept"}
+    assert m.write_record(rec) == 0
+    rec["BAL"] = 99
+    result = m.read_record(9)
+    assert result["BAL"] == 2
+    assert result["EXTRA"] == "kept"
+    assert result["FILE_STATUS"] == "00"
+    result["BAL"] = 88
+    assert m.records[9]["BAL"] == 2
+    assert "FILE_STATUS" not in m.records[9]
+    assert m.write_record(rec) == 0
+    assert m.read_record(9)["BAL"] == 99
+
+
+def test_surcharge_and_reconcile():
+    assert m.compute_surcharge(0) == 0
+    assert m.compute_surcharge(-10) == 0
+    assert m.compute_surcharge(100) == 105.2
+    assert m.compute_surcharge(10, 2) == 20.2
+    assert m.compute_surcharge(1.234, 1) == 1.43
+    assert m.reconcile() == {"MODULE_ID": 2, "ACTIVE_COUNT": 0, "NET_BALANCE": 0, "ADJUSTED_SURCHARGE": 0}
+    m.initialize()
+    result = m.reconcile()
+    assert result["ACTIVE_COUNT"] == 2
+    assert result["NET_BALANCE"] == 150.5
+    assert result["ADJUSTED_SURCHARGE"] == m.compute_surcharge(150.5)
+    m.records[1001]["BAL"] = -10
+    assert m.reconcile()["ADJUSTED_SURCHARGE"] == 0
+
+
+def test_audit_and_batch():
+    assert m.audit("abcdefghijklmnopq", "yes") == {"MODULE": 2, "EVENT": "ABCDEFGHIJKLMNOP", "STATUS": "Y"}
+    assert m.audit("", "") == {"MODULE": 2, "EVENT": "", "STATUS": ""}
+    assert m.process_batch() == 0
+    m.initialize()
+    assert m.process_batch() == 2
+    assert m.read_record(1001)["BAL"] == 151.75
+    assert m.read_record(1002)["BAL"] == 1.25
+    assert m.read_record(1003)["BAL"] == -45.2
+    assert m.process_batch() == 2
+    assert m.read_record(1001)["BAL"] == 153
+    assert m.audit_log[-1] == {"MODULE": 2, "EVENT": "BATCH_SWEEP", "STATUS": "Y"}
+    assert len(m.audit_log) == 5
+
+
+def test_http_contract():
+    app = FastAPI()
+    app.include_router(m.router)
+    with TestClient(app) as client:
+        assert client.post("/modules/02/initialize").json() is True
+        assert client.get("/modules/02/records/1001").json()["CODE"] == "MOD_02_A"
+        assert client.get("/modules/02/records/9").json()["FILE_STATUS"] == "23"
+        assert client.post("/modules/02/validate", json={}).json() is False
+        assert client.post("/modules/02/records", json={}).json() == 12
+        assert client.get("/modules/02/surcharge", params={"base_amt": 100}).json() == 105.2
+        assert client.get("/modules/02/reconcile").json()["MODULE_ID"] == 2
+        assert client.post("/modules/02/audit", params={"event_type": "x", "status_flg": "y"}).json()["EVENT"] == "X"
+        assert client.post("/modules/02/batch").json() == 2
+        assert client.get("/modules/02/records/invalid").status_code == 422
+        assert client.get("/modules/02/surcharge").status_code == 422
+        assert client.post("/modules/02/records", json=[]).status_code == 422
+]]></output_file>
+<output_file path="module_03.py"><![CDATA[
+"""Module 03: thread-safe, process-local storage with legacy result semantics."""
+from threading import RLock
+from typing import Any
+from fastapi import APIRouter
+
+router = APIRouter(prefix="/modules/03", tags=["03"])
+records: dict[int, dict[str, Any]] = {}
+audit_log: list[dict[str, Any]] = []
+_lock = RLock()
+
+
+@router.post("/initialize")
+def initialize() -> bool:
+    global records
+    with _lock:
+        records = {
+            1001: {"ID": 1001, "CODE": "MOD_03_A", "BAL": 150.50, "ACTIVE": True},
+            1002: {"ID": 1002, "CODE": "MOD_03_B", "BAL": 0.00, "ACTIVE": True},
+            1003: {"ID": 1003, "CODE": "MOD_03_C", "BAL": -45.20, "ACTIVE": False},
+        }
+    return True
+
+
+@router.post("/validate")
+def validate_record(rec: dict[str, Any]) -> bool:
+    if not rec or "ID" not in rec or "CODE" not in rec:
+        return False
+    return isinstance(rec.get("BAL"), (int, float)) and rec.get("ACTIVE") in (True, False)
+
+
+@router.get("/records/{rec_id}")
+def read_record(rec_id: int) -> dict[str, Any]:
+    with _lock:
+        if rec_id in records:
+            rec = dict(records[rec_id])
+            rec["FILE_STATUS"] = "00"
+            return rec
+    return {"ID": rec_id, "FILE_STATUS": "23", "ERR_MSG": "KEY NOT FOUND"}
+
+
+@router.post("/records")
+def write_record(rec: dict[str, Any]) -> int:
+    if not validate_record(rec):
+        return 12
+    with _lock:
+        try:
+            records[rec["ID"]] = dict(rec)
+        except TypeError:
+            return 12
+    return 0
+
+
+@router.get("/surcharge")
+def compute_surcharge(base_amt: float, factor: float = 1.05) -> float:
+    if base_amt <= 0.0:
+        return 0.0
+    return round(float(base_amt) * factor + 3 * 0.10, 2)
+
+
+@router.get("/reconcile")
+def reconcile() -> dict[str, Any]:
+    with _lock:
+        total = sum(r.get("BAL", 0.0) for r in records.values() if r.get("ACTIVE"))
+        return {
+            "MODULE_ID": 3,
+            "ACTIVE_COUNT": sum(1 for r in records.values() if r.get("ACTIVE")),
+            "NET_BALANCE": round(total, 2),
+            "ADJUSTED_SURCHARGE": compute_surcharge(total),
+        }
+
+
+@router.post("/audit")
+def audit(event_type: str, status_flg: str) -> dict[str, Any]:
+    entry = {"MODULE": 3, "EVENT": event_type[:16].upper(), "STATUS": status_flg[:1].upper()}
+    with _lock:
+        audit_log.append(entry)
+    return entry
+
+
+@router.post("/batch")
+def process_batch() -> int:
+    with _lock:
+        reconcile()
+        processed = 0
+        for rec in records.values():
+            if rec.get("ACTIVE"):
+                rec["BAL"] = round(rec["BAL"] + 1.25, 2)
+                processed += 1
+        audit("BATCH_SWEEP", "Y")
+        return processed
+]]></output_file>
+<output_file path="tests/test_module_03.py"><![CDATA[
+import module_03 as m
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+
+def setup_function():
+    m.records.clear()
+    m.audit_log.clear()
+
+
+def test_initialize_resets_records_not_audit():
+    m.audit("old", "n")
+    assert m.initialize() is True
+    assert m.records == {
+        1001: {"ID": 1001, "CODE": "MOD_03_A", "BAL": 150.5, "ACTIVE": True},
+        1002: {"ID": 1002, "CODE": "MOD_03_B", "BAL": 0.0, "ACTIVE": True},
+        1003: {"ID": 1003, "CODE": "MOD_03_C", "BAL": -45.2, "ACTIVE": False},
+    }
+    m.process_batch()
+    m.initialize()
+    assert m.records[1001]["BAL"] == 150.5
+    assert len(m.audit_log) == 2
+
+
+def test_validation():
+    assert not m.validate_record({})
+    assert not m.validate_record({"CODE": "X", "BAL": 1, "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "BAL": 1, "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "BAL": "1", "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "BAL": 1})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "BAL": 1, "ACTIVE": "Y"})
+    assert m.validate_record({"ID": 1, "CODE": "", "BAL": -1.5, "ACTIVE": False})
+    assert m.validate_record({"ID": 1, "CODE": None, "BAL": True, "ACTIVE": 1})
+
+
+def test_read_write_copy_upsert_and_errors():
+    assert m.read_record(9) == {"ID": 9, "FILE_STATUS": "23", "ERR_MSG": "KEY NOT FOUND"}
+    assert m.write_record({}) == 12
+    assert m.write_record({"ID": [], "CODE": "X", "BAL": 1, "ACTIVE": True}) == 12
+    rec = {"ID": 9, "CODE": "X", "BAL": 2, "ACTIVE": True, "EXTRA": "kept"}
+    assert m.write_record(rec) == 0
+    rec["BAL"] = 99
+    result = m.read_record(9)
+    assert result["BAL"] == 2
+    assert result["EXTRA"] == "kept"
+    assert result["FILE_STATUS"] == "00"
+    result["BAL"] = 88
+    assert m.records[9]["BAL"] == 2
+    assert "FILE_STATUS" not in m.records[9]
+    assert m.write_record(rec) == 0
+    assert m.read_record(9)["BAL"] == 99
+
+
+def test_surcharge_and_reconcile():
+    assert m.compute_surcharge(0) == 0
+    assert m.compute_surcharge(-10) == 0
+    assert m.compute_surcharge(100) == 105.3
+    assert m.compute_surcharge(10, 2) == 20.3
+    assert m.compute_surcharge(1.234, 1) == 1.53
+    assert m.reconcile() == {"MODULE_ID": 3, "ACTIVE_COUNT": 0, "NET_BALANCE": 0, "ADJUSTED_SURCHARGE": 0}
+    m.initialize()
+    result = m.reconcile()
+    assert result["ACTIVE_COUNT"] == 2
+    assert result["NET_BALANCE"] == 150.5
+    assert result["ADJUSTED_SURCHARGE"] == m.compute_surcharge(150.5)
+    m.records[1001]["BAL"] = -10
+    assert m.reconcile()["ADJUSTED_SURCHARGE"] == 0
+
+
+def test_audit_and_batch():
+    assert m.audit("abcdefghijklmnopq", "yes") == {"MODULE": 3, "EVENT": "ABCDEFGHIJKLMNOP", "STATUS": "Y"}
+    assert m.audit("", "") == {"MODULE": 3, "EVENT": "", "STATUS": ""}
+    assert m.process_batch() == 0
+    m.initialize()
+    assert m.process_batch() == 2
+    assert m.read_record(1001)["BAL"] == 151.75
+    assert m.read_record(1002)["BAL"] == 1.25
+    assert m.read_record(1003)["BAL"] == -45.2
+    assert m.process_batch() == 2
+    assert m.read_record(1001)["BAL"] == 153
+    assert m.audit_log[-1] == {"MODULE": 3, "EVENT": "BATCH_SWEEP", "STATUS": "Y"}
+    assert len(m.audit_log) == 5
+
+
+def test_http_contract():
+    app = FastAPI()
+    app.include_router(m.router)
+    with TestClient(app) as client:
+        assert client.post("/modules/03/initialize").json() is True
+        assert client.get("/modules/03/records/1001").json()["CODE"] == "MOD_03_A"
+        assert client.get("/modules/03/records/9").json()["FILE_STATUS"] == "23"
+        assert client.post("/modules/03/validate", json={}).json() is False
+        assert client.post("/modules/03/records", json={}).json() == 12
+        assert client.get("/modules/03/surcharge", params={"base_amt": 100}).json() == 105.3
+        assert client.get("/modules/03/reconcile").json()["MODULE_ID"] == 3
+        assert client.post("/modules/03/audit", params={"event_type": "x", "status_flg": "y"}).json()["EVENT"] == "X"
+        assert client.post("/modules/03/batch").json() == 2
+        assert client.get("/modules/03/records/invalid").status_code == 422
+        assert client.get("/modules/03/surcharge").status_code == 422
+        assert client.post("/modules/03/records", json=[]).status_code == 422
+]]></output_file>
+<output_file path="module_04.py"><![CDATA[
+"""Module 04: thread-safe, process-local storage with legacy result semantics."""
+from threading import RLock
+from typing import Any
+from fastapi import APIRouter
+
+router = APIRouter(prefix="/modules/04", tags=["04"])
+records: dict[int, dict[str, Any]] = {}
+audit_log: list[dict[str, Any]] = []
+_lock = RLock()
+
+
+@router.post("/initialize")
+def initialize() -> bool:
+    global records
+    with _lock:
+        records = {
+            1001: {"ID": 1001, "CODE": "MOD_04_A", "BAL": 150.50, "ACTIVE": True},
+            1002: {"ID": 1002, "CODE": "MOD_04_B", "BAL": 0.00, "ACTIVE": True},
+            1003: {"ID": 1003, "CODE": "MOD_04_C", "BAL": -45.20, "ACTIVE": False},
+        }
+    return True
+
+
+@router.post("/validate")
+def validate_record(rec: dict[str, Any]) -> bool:
+    if not rec or "ID" not in rec or "CODE" not in rec:
+        return False
+    return isinstance(rec.get("BAL"), (int, float)) and rec.get("ACTIVE") in (True, False)
+
+
+@router.get("/records/{rec_id}")
+def read_record(rec_id: int) -> dict[str, Any]:
+    with _lock:
+        if rec_id in records:
+            rec = dict(records[rec_id])
+            rec["FILE_STATUS"] = "00"
+            return rec
+    return {"ID": rec_id, "FILE_STATUS": "23", "ERR_MSG": "KEY NOT FOUND"}
+
+
+@router.post("/records")
+def write_record(rec: dict[str, Any]) -> int:
+    if not validate_record(rec):
+        return 12
+    with _lock:
+        try:
+            records[rec["ID"]] = dict(rec)
+        except TypeError:
+            return 12
+    return 0
+
+
+@router.get("/surcharge")
+def compute_surcharge(base_amt: float, factor: float = 1.05) -> float:
+    if base_amt <= 0.0:
+        return 0.0
+    return round(float(base_amt) * factor + 4 * 0.10, 2)
+
+
+@router.get("/reconcile")
+def reconcile() -> dict[str, Any]:
+    with _lock:
+        total = sum(r.get("BAL", 0.0) for r in records.values() if r.get("ACTIVE"))
+        return {
+            "MODULE_ID": 4,
+            "ACTIVE_COUNT": sum(1 for r in records.values() if r.get("ACTIVE")),
+            "NET_BALANCE": round(total, 2),
+            "ADJUSTED_SURCHARGE": compute_surcharge(total),
+        }
+
+
+@router.post("/audit")
+def audit(event_type: str, status_flg: str) -> dict[str, Any]:
+    entry = {"MODULE": 4, "EVENT": event_type[:16].upper(), "STATUS": status_flg[:1].upper()}
+    with _lock:
+        audit_log.append(entry)
+    return entry
+
+
+@router.post("/batch")
+def process_batch() -> int:
+    with _lock:
+        reconcile()
+        processed = 0
+        for rec in records.values():
+            if rec.get("ACTIVE"):
+                rec["BAL"] = round(rec["BAL"] + 1.25, 2)
+                processed += 1
+        audit("BATCH_SWEEP", "Y")
+        return processed
+]]></output_file>
+<output_file path="tests/test_module_04.py"><![CDATA[
+import module_04 as m
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+
+def setup_function():
+    m.records.clear()
+    m.audit_log.clear()
+
+
+def test_initialize_resets_records_not_audit():
+    m.audit("old", "n")
+    assert m.initialize() is True
+    assert m.records == {
+        1001: {"ID": 1001, "CODE": "MOD_04_A", "BAL": 150.5, "ACTIVE": True},
+        1002: {"ID": 1002, "CODE": "MOD_04_B", "BAL": 0.0, "ACTIVE": True},
+        1003: {"ID": 1003, "CODE": "MOD_04_C", "BAL": -45.2, "ACTIVE": False},
+    }
+    m.process_batch()
+    m.initialize()
+    assert m.records[1001]["BAL"] == 150.5
+    assert len(m.audit_log) == 2
+
+
+def test_validation():
+    assert not m.validate_record({})
+    assert not m.validate_record({"CODE": "X", "BAL": 1, "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "BAL": 1, "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "BAL": "1", "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "BAL": 1})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "BAL": 1, "ACTIVE": "Y"})
+    assert m.validate_record({"ID": 1, "CODE": "", "BAL": -1.5, "ACTIVE": False})
+    assert m.validate_record({"ID": 1, "CODE": None, "BAL": True, "ACTIVE": 1})
+
+
+def test_read_write_copy_upsert_and_errors():
+    assert m.read_record(9) == {"ID": 9, "FILE_STATUS": "23", "ERR_MSG": "KEY NOT FOUND"}
+    assert m.write_record({}) == 12
+    assert m.write_record({"ID": [], "CODE": "X", "BAL": 1, "ACTIVE": True}) == 12
+    rec = {"ID": 9, "CODE": "X", "BAL": 2, "ACTIVE": True, "EXTRA": "kept"}
+    assert m.write_record(rec) == 0
+    rec["BAL"] = 99
+    result = m.read_record(9)
+    assert result["BAL"] == 2
+    assert result["EXTRA"] == "kept"
+    assert result["FILE_STATUS"] == "00"
+    result["BAL"] = 88
+    assert m.records[9]["BAL"] == 2
+    assert "FILE_STATUS" not in m.records[9]
+    assert m.write_record(rec) == 0
+    assert m.read_record(9)["BAL"] == 99
+
+
+def test_surcharge_and_reconcile():
+    assert m.compute_surcharge(0) == 0
+    assert m.compute_surcharge(-10) == 0
+    assert m.compute_surcharge(100) == 105.4
+    assert m.compute_surcharge(10, 2) == 20.4
+    assert m.compute_surcharge(1.234, 1) == 1.63
+    assert m.reconcile() == {"MODULE_ID": 4, "ACTIVE_COUNT": 0, "NET_BALANCE": 0, "ADJUSTED_SURCHARGE": 0}
+    m.initialize()
+    result = m.reconcile()
+    assert result["ACTIVE_COUNT"] == 2
+    assert result["NET_BALANCE"] == 150.5
+    assert result["ADJUSTED_SURCHARGE"] == m.compute_surcharge(150.5)
+    m.records[1001]["BAL"] = -10
+    assert m.reconcile()["ADJUSTED_SURCHARGE"] == 0
+
+
+def test_audit_and_batch():
+    assert m.audit("abcdefghijklmnopq", "yes") == {"MODULE": 4, "EVENT": "ABCDEFGHIJKLMNOP", "STATUS": "Y"}
+    assert m.audit("", "") == {"MODULE": 4, "EVENT": "", "STATUS": ""}
+    assert m.process_batch() == 0
+    m.initialize()
+    assert m.process_batch() == 2
+    assert m.read_record(1001)["BAL"] == 151.75
+    assert m.read_record(1002)["BAL"] == 1.25
+    assert m.read_record(1003)["BAL"] == -45.2
+    assert m.process_batch() == 2
+    assert m.read_record(1001)["BAL"] == 153
+    assert m.audit_log[-1] == {"MODULE": 4, "EVENT": "BATCH_SWEEP", "STATUS": "Y"}
+    assert len(m.audit_log) == 5
+
+
+def test_http_contract():
+    app = FastAPI()
+    app.include_router(m.router)
+    with TestClient(app) as client:
+        assert client.post("/modules/04/initialize").json() is True
+        assert client.get("/modules/04/records/1001").json()["CODE"] == "MOD_04_A"
+        assert client.get("/modules/04/records/9").json()["FILE_STATUS"] == "23"
+        assert client.post("/modules/04/validate", json={}).json() is False
+        assert client.post("/modules/04/records", json={}).json() == 12
+        assert client.get("/modules/04/surcharge", params={"base_amt": 100}).json() == 105.4
+        assert client.get("/modules/04/reconcile").json()["MODULE_ID"] == 4
+        assert client.post("/modules/04/audit", params={"event_type": "x", "status_flg": "y"}).json()["EVENT"] == "X"
+        assert client.post("/modules/04/batch").json() == 2
+        assert client.get("/modules/04/records/invalid").status_code == 422
+        assert client.get("/modules/04/surcharge").status_code == 422
+        assert client.post("/modules/04/records", json=[]).status_code == 422
+]]></output_file>
+<output_file path="module_05.py"><![CDATA[
+"""Module 05: thread-safe, process-local storage with legacy result semantics."""
+from threading import RLock
+from typing import Any
+from fastapi import APIRouter
+
+router = APIRouter(prefix="/modules/05", tags=["05"])
+records: dict[int, dict[str, Any]] = {}
+audit_log: list[dict[str, Any]] = []
+_lock = RLock()
+
+
+@router.post("/initialize")
+def initialize() -> bool:
+    global records
+    with _lock:
+        records = {
+            1001: {"ID": 1001, "CODE": "MOD_05_A", "BAL": 150.50, "ACTIVE": True},
+            1002: {"ID": 1002, "CODE": "MOD_05_B", "BAL": 0.00, "ACTIVE": True},
+            1003: {"ID": 1003, "CODE": "MOD_05_C", "BAL": -45.20, "ACTIVE": False},
+        }
+    return True
+
+
+@router.post("/validate")
+def validate_record(rec: dict[str, Any]) -> bool:
+    if not rec or "ID" not in rec or "CODE" not in rec:
+        return False
+    return isinstance(rec.get("BAL"), (int, float)) and rec.get("ACTIVE") in (True, False)
+
+
+@router.get("/records/{rec_id}")
+def read_record(rec_id: int) -> dict[str, Any]:
+    with _lock:
+        if rec_id in records:
+            rec = dict(records[rec_id])
+            rec["FILE_STATUS"] = "00"
+            return rec
+    return {"ID": rec_id, "FILE_STATUS": "23", "ERR_MSG": "KEY NOT FOUND"}
+
+
+@router.post("/records")
+def write_record(rec: dict[str, Any]) -> int:
+    if not validate_record(rec):
+        return 12
+    with _lock:
+        try:
+            records[rec["ID"]] = dict(rec)
+        except TypeError:
+            return 12
+    return 0
+
+
+@router.get("/surcharge")
+def compute_surcharge(base_amt: float, factor: float = 1.05) -> float:
+    if base_amt <= 0.0:
+        return 0.0
+    return round(float(base_amt) * factor + 5 * 0.10, 2)
+
+
+@router.get("/reconcile")
+def reconcile() -> dict[str, Any]:
+    with _lock:
+        total = sum(r.get("BAL", 0.0) for r in records.values() if r.get("ACTIVE"))
+        return {
+            "MODULE_ID": 5,
+            "ACTIVE_COUNT": sum(1 for r in records.values() if r.get("ACTIVE")),
+            "NET_BALANCE": round(total, 2),
+            "ADJUSTED_SURCHARGE": compute_surcharge(total),
+        }
+
+
+@router.post("/audit")
+def audit(event_type: str, status_flg: str) -> dict[str, Any]:
+    entry = {"MODULE": 5, "EVENT": event_type[:16].upper(), "STATUS": status_flg[:1].upper()}
+    with _lock:
+        audit_log.append(entry)
+    return entry
+
+
+@router.post("/batch")
+def process_batch() -> int:
+    with _lock:
+        reconcile()
+        processed = 0
+        for rec in records.values():
+            if rec.get("ACTIVE"):
+                rec["BAL"] = round(rec["BAL"] + 1.25, 2)
+                processed += 1
+        audit("BATCH_SWEEP", "Y")
+        return processed
+]]></output_file>
+<output_file path="tests/test_module_05.py"><![CDATA[
+import module_05 as m
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+
+def setup_function():
+    m.records.clear()
+    m.audit_log.clear()
+
+
+def test_initialize_resets_records_not_audit():
+    m.audit("old", "n")
+    assert m.initialize() is True
+    assert m.records == {
+        1001: {"ID": 1001, "CODE": "MOD_05_A", "BAL": 150.5, "ACTIVE": True},
+        1002: {"ID": 1002, "CODE": "MOD_05_B", "BAL": 0.0, "ACTIVE": True},
+        1003: {"ID": 1003, "CODE": "MOD_05_C", "BAL": -45.2, "ACTIVE": False},
+    }
+    m.process_batch()
+    m.initialize()
+    assert m.records[1001]["BAL"] == 150.5
+    assert len(m.audit_log) == 2
+
+
+def test_validation():
+    assert not m.validate_record({})
+    assert not m.validate_record({"CODE": "X", "BAL": 1, "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "BAL": 1, "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "BAL": "1", "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "BAL": 1})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "BAL": 1, "ACTIVE": "Y"})
+    assert m.validate_record({"ID": 1, "CODE": "", "BAL": -1.5, "ACTIVE": False})
+    assert m.validate_record({"ID": 1, "CODE": None, "BAL": True, "ACTIVE": 1})
+
+
+def test_read_write_copy_upsert_and_errors():
+    assert m.read_record(9) == {"ID": 9, "FILE_STATUS": "23", "ERR_MSG": "KEY NOT FOUND"}
+    assert m.write_record({}) == 12
+    assert m.write_record({"ID": [], "CODE": "X", "BAL": 1, "ACTIVE": True}) == 12
+    rec = {"ID": 9, "CODE": "X", "BAL": 2, "ACTIVE": True, "EXTRA": "kept"}
+    assert m.write_record(rec) == 0
+    rec["BAL"] = 99
+    result = m.read_record(9)
+    assert result["BAL"] == 2
+    assert result["EXTRA"] == "kept"
+    assert result["FILE_STATUS"] == "00"
+    result["BAL"] = 88
+    assert m.records[9]["BAL"] == 2
+    assert "FILE_STATUS" not in m.records[9]
+    assert m.write_record(rec) == 0
+    assert m.read_record(9)["BAL"] == 99
+
+
+def test_surcharge_and_reconcile():
+    assert m.compute_surcharge(0) == 0
+    assert m.compute_surcharge(-10) == 0
+    assert m.compute_surcharge(100) == 105.5
+    assert m.compute_surcharge(10, 2) == 20.5
+    assert m.compute_surcharge(1.234, 1) == 1.73
+    assert m.reconcile() == {"MODULE_ID": 5, "ACTIVE_COUNT": 0, "NET_BALANCE": 0, "ADJUSTED_SURCHARGE": 0}
+    m.initialize()
+    result = m.reconcile()
+    assert result["ACTIVE_COUNT"] == 2
+    assert result["NET_BALANCE"] == 150.5
+    assert result["ADJUSTED_SURCHARGE"] == m.compute_surcharge(150.5)
+    m.records[1001]["BAL"] = -10
+    assert m.reconcile()["ADJUSTED_SURCHARGE"] == 0
+
+
+def test_audit_and_batch():
+    assert m.audit("abcdefghijklmnopq", "yes") == {"MODULE": 5, "EVENT": "ABCDEFGHIJKLMNOP", "STATUS": "Y"}
+    assert m.audit("", "") == {"MODULE": 5, "EVENT": "", "STATUS": ""}
+    assert m.process_batch() == 0
+    m.initialize()
+    assert m.process_batch() == 2
+    assert m.read_record(1001)["BAL"] == 151.75
+    assert m.read_record(1002)["BAL"] == 1.25
+    assert m.read_record(1003)["BAL"] == -45.2
+    assert m.process_batch() == 2
+    assert m.read_record(1001)["BAL"] == 153
+    assert m.audit_log[-1] == {"MODULE": 5, "EVENT": "BATCH_SWEEP", "STATUS": "Y"}
+    assert len(m.audit_log) == 5
+
+
+def test_http_contract():
+    app = FastAPI()
+    app.include_router(m.router)
+    with TestClient(app) as client:
+        assert client.post("/modules/05/initialize").json() is True
+        assert client.get("/modules/05/records/1001").json()["CODE"] == "MOD_05_A"
+        assert client.get("/modules/05/records/9").json()["FILE_STATUS"] == "23"
+        assert client.post("/modules/05/validate", json={}).json() is False
+        assert client.post("/modules/05/records", json={}).json() == 12
+        assert client.get("/modules/05/surcharge", params={"base_amt": 100}).json() == 105.5
+        assert client.get("/modules/05/reconcile").json()["MODULE_ID"] == 5
+        assert client.post("/modules/05/audit", params={"event_type": "x", "status_flg": "y"}).json()["EVENT"] == "X"
+        assert client.post("/modules/05/batch").json() == 2
+        assert client.get("/modules/05/records/invalid").status_code == 422
+        assert client.get("/modules/05/surcharge").status_code == 422
+        assert client.post("/modules/05/records", json=[]).status_code == 422
+]]></output_file>
+<output_file path="module_06.py"><![CDATA[
+"""Module 06: thread-safe, process-local storage with legacy result semantics."""
+from threading import RLock
+from typing import Any
+from fastapi import APIRouter
+
+router = APIRouter(prefix="/modules/06", tags=["06"])
+records: dict[int, dict[str, Any]] = {}
+audit_log: list[dict[str, Any]] = []
+_lock = RLock()
+
+
+@router.post("/initialize")
+def initialize() -> bool:
+    global records
+    with _lock:
+        records = {
+            1001: {"ID": 1001, "CODE": "MOD_06_A", "BAL": 150.50, "ACTIVE": True},
+            1002: {"ID": 1002, "CODE": "MOD_06_B", "BAL": 0.00, "ACTIVE": True},
+            1003: {"ID": 1003, "CODE": "MOD_06_C", "BAL": -45.20, "ACTIVE": False},
+        }
+    return True
+
+
+@router.post("/validate")
+def validate_record(rec: dict[str, Any]) -> bool:
+    if not rec or "ID" not in rec or "CODE" not in rec:
+        return False
+    return isinstance(rec.get("BAL"), (int, float)) and rec.get("ACTIVE") in (True, False)
+
+
+@router.get("/records/{rec_id}")
+def read_record(rec_id: int) -> dict[str, Any]:
+    with _lock:
+        if rec_id in records:
+            rec = dict(records[rec_id])
+            rec["FILE_STATUS"] = "00"
+            return rec
+    return {"ID": rec_id, "FILE_STATUS": "23", "ERR_MSG": "KEY NOT FOUND"}
+
+
+@router.post("/records")
+def write_record(rec: dict[str, Any]) -> int:
+    if not validate_record(rec):
+        return 12
+    with _lock:
+        try:
+            records[rec["ID"]] = dict(rec)
+        except TypeError:
+            return 12
+    return 0
+
+
+@router.get("/surcharge")
+def compute_surcharge(base_amt: float, factor: float = 1.05) -> float:
+    if base_amt <= 0.0:
+        return 0.0
+    return round(float(base_amt) * factor + 6 * 0.10, 2)
+
+
+@router.get("/reconcile")
+def reconcile() -> dict[str, Any]:
+    with _lock:
+        total = sum(r.get("BAL", 0.0) for r in records.values() if r.get("ACTIVE"))
+        return {
+            "MODULE_ID": 6,
+            "ACTIVE_COUNT": sum(1 for r in records.values() if r.get("ACTIVE")),
+            "NET_BALANCE": round(total, 2),
+            "ADJUSTED_SURCHARGE": compute_surcharge(total),
+        }
+
+
+@router.post("/audit")
+def audit(event_type: str, status_flg: str) -> dict[str, Any]:
+    entry = {"MODULE": 6, "EVENT": event_type[:16].upper(), "STATUS": status_flg[:1].upper()}
+    with _lock:
+        audit_log.append(entry)
+    return entry
+
+
+@router.post("/batch")
+def process_batch() -> int:
+    with _lock:
+        reconcile()
+        processed = 0
+        for rec in records.values():
+            if rec.get("ACTIVE"):
+                rec["BAL"] = round(rec["BAL"] + 1.25, 2)
+                processed += 1
+        audit("BATCH_SWEEP", "Y")
+        return processed
+]]></output_file>
+<output_file path="tests/test_module_06.py"><![CDATA[
+import module_06 as m
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+
+def setup_function():
+    m.records.clear()
+    m.audit_log.clear()
+
+
+def test_initialize_resets_records_not_audit():
+    m.audit("old", "n")
+    assert m.initialize() is True
+    assert m.records == {
+        1001: {"ID": 1001, "CODE": "MOD_06_A", "BAL": 150.5, "ACTIVE": True},
+        1002: {"ID": 1002, "CODE": "MOD_06_B", "BAL": 0.0, "ACTIVE": True},
+        1003: {"ID": 1003, "CODE": "MOD_06_C", "BAL": -45.2, "ACTIVE": False},
+    }
+    m.process_batch()
+    m.initialize()
+    assert m.records[1001]["BAL"] == 150.5
+    assert len(m.audit_log) == 2
+
+
+def test_validation():
+    assert not m.validate_record({})
+    assert not m.validate_record({"CODE": "X", "BAL": 1, "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "BAL": 1, "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "BAL": "1", "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "BAL": 1})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "BAL": 1, "ACTIVE": "Y"})
+    assert m.validate_record({"ID": 1, "CODE": "", "BAL": -1.5, "ACTIVE": False})
+    assert m.validate_record({"ID": 1, "CODE": None, "BAL": True, "ACTIVE": 1})
+
+
+def test_read_write_copy_upsert_and_errors():
+    assert m.read_record(9) == {"ID": 9, "FILE_STATUS": "23", "ERR_MSG": "KEY NOT FOUND"}
+    assert m.write_record({}) == 12
+    assert m.write_record({"ID": [], "CODE": "X", "BAL": 1, "ACTIVE": True}) == 12
+    rec = {"ID": 9, "CODE": "X", "BAL": 2, "ACTIVE": True, "EXTRA": "kept"}
+    assert m.write_record(rec) == 0
+    rec["BAL"] = 99
+    result = m.read_record(9)
+    assert result["BAL"] == 2
+    assert result["EXTRA"] == "kept"
+    assert result["FILE_STATUS"] == "00"
+    result["BAL"] = 88
+    assert m.records[9]["BAL"] == 2
+    assert "FILE_STATUS" not in m.records[9]
+    assert m.write_record(rec) == 0
+    assert m.read_record(9)["BAL"] == 99
+
+
+def test_surcharge_and_reconcile():
+    assert m.compute_surcharge(0) == 0
+    assert m.compute_surcharge(-10) == 0
+    assert m.compute_surcharge(100) == 105.6
+    assert m.compute_surcharge(10, 2) == 20.6
+    assert m.compute_surcharge(1.234, 1) == 1.83
+    assert m.reconcile() == {"MODULE_ID": 6, "ACTIVE_COUNT": 0, "NET_BALANCE": 0, "ADJUSTED_SURCHARGE": 0}
+    m.initialize()
+    result = m.reconcile()
+    assert result["ACTIVE_COUNT"] == 2
+    assert result["NET_BALANCE"] == 150.5
+    assert result["ADJUSTED_SURCHARGE"] == m.compute_surcharge(150.5)
+    m.records[1001]["BAL"] = -10
+    assert m.reconcile()["ADJUSTED_SURCHARGE"] == 0
+
+
+def test_audit_and_batch():
+    assert m.audit("abcdefghijklmnopq", "yes") == {"MODULE": 6, "EVENT": "ABCDEFGHIJKLMNOP", "STATUS": "Y"}
+    assert m.audit("", "") == {"MODULE": 6, "EVENT": "", "STATUS": ""}
+    assert m.process_batch() == 0
+    m.initialize()
+    assert m.process_batch() == 2
+    assert m.read_record(1001)["BAL"] == 151.75
+    assert m.read_record(1002)["BAL"] == 1.25
+    assert m.read_record(1003)["BAL"] == -45.2
+    assert m.process_batch() == 2
+    assert m.read_record(1001)["BAL"] == 153
+    assert m.audit_log[-1] == {"MODULE": 6, "EVENT": "BATCH_SWEEP", "STATUS": "Y"}
+    assert len(m.audit_log) == 5
+
+
+def test_http_contract():
+    app = FastAPI()
+    app.include_router(m.router)
+    with TestClient(app) as client:
+        assert client.post("/modules/06/initialize").json() is True
+        assert client.get("/modules/06/records/1001").json()["CODE"] == "MOD_06_A"
+        assert client.get("/modules/06/records/9").json()["FILE_STATUS"] == "23"
+        assert client.post("/modules/06/validate", json={}).json() is False
+        assert client.post("/modules/06/records", json={}).json() == 12
+        assert client.get("/modules/06/surcharge", params={"base_amt": 100}).json() == 105.6
+        assert client.get("/modules/06/reconcile").json()["MODULE_ID"] == 6
+        assert client.post("/modules/06/audit", params={"event_type": "x", "status_flg": "y"}).json()["EVENT"] == "X"
+        assert client.post("/modules/06/batch").json() == 2
+        assert client.get("/modules/06/records/invalid").status_code == 422
+        assert client.get("/modules/06/surcharge").status_code == 422
+        assert client.post("/modules/06/records", json=[]).status_code == 422
+]]></output_file>
+<output_file path="module_07.py"><![CDATA[
+"""Module 07: thread-safe, process-local storage with legacy result semantics."""
+from threading import RLock
+from typing import Any
+from fastapi import APIRouter
+
+router = APIRouter(prefix="/modules/07", tags=["07"])
+records: dict[int, dict[str, Any]] = {}
+audit_log: list[dict[str, Any]] = []
+_lock = RLock()
+
+
+@router.post("/initialize")
+def initialize() -> bool:
+    global records
+    with _lock:
+        records = {
+            1001: {"ID": 1001, "CODE": "MOD_07_A", "BAL": 150.50, "ACTIVE": True},
+            1002: {"ID": 1002, "CODE": "MOD_07_B", "BAL": 0.00, "ACTIVE": True},
+            1003: {"ID": 1003, "CODE": "MOD_07_C", "BAL": -45.20, "ACTIVE": False},
+        }
+    return True
+
+
+@router.post("/validate")
+def validate_record(rec: dict[str, Any]) -> bool:
+    if not rec or "ID" not in rec or "CODE" not in rec:
+        return False
+    return isinstance(rec.get("BAL"), (int, float)) and rec.get("ACTIVE") in (True, False)
+
+
+@router.get("/records/{rec_id}")
+def read_record(rec_id: int) -> dict[str, Any]:
+    with _lock:
+        if rec_id in records:
+            rec = dict(records[rec_id])
+            rec["FILE_STATUS"] = "00"
+            return rec
+    return {"ID": rec_id, "FILE_STATUS": "23", "ERR_MSG": "KEY NOT FOUND"}
+
+
+@router.post("/records")
+def write_record(rec: dict[str, Any]) -> int:
+    if not validate_record(rec):
+        return 12
+    with _lock:
+        try:
+            records[rec["ID"]] = dict(rec)
+        except TypeError:
+            return 12
+    return 0
+
+
+@router.get("/surcharge")
+def compute_surcharge(base_amt: float, factor: float = 1.05) -> float:
+    if base_amt <= 0.0:
+        return 0.0
+    return round(float(base_amt) * factor + 7 * 0.10, 2)
+
+
+@router.get("/reconcile")
+def reconcile() -> dict[str, Any]:
+    with _lock:
+        total = sum(r.get("BAL", 0.0) for r in records.values() if r.get("ACTIVE"))
+        return {
+            "MODULE_ID": 7,
+            "ACTIVE_COUNT": sum(1 for r in records.values() if r.get("ACTIVE")),
+            "NET_BALANCE": round(total, 2),
+            "ADJUSTED_SURCHARGE": compute_surcharge(total),
+        }
+
+
+@router.post("/audit")
+def audit(event_type: str, status_flg: str) -> dict[str, Any]:
+    entry = {"MODULE": 7, "EVENT": event_type[:16].upper(), "STATUS": status_flg[:1].upper()}
+    with _lock:
+        audit_log.append(entry)
+    return entry
+
+
+@router.post("/batch")
+def process_batch() -> int:
+    with _lock:
+        reconcile()
+        processed = 0
+        for rec in records.values():
+            if rec.get("ACTIVE"):
+                rec["BAL"] = round(rec["BAL"] + 1.25, 2)
+                processed += 1
+        audit("BATCH_SWEEP", "Y")
+        return processed
+]]></output_file>
+<output_file path="tests/test_module_07.py"><![CDATA[
+import module_07 as m
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+
+def setup_function():
+    m.records.clear()
+    m.audit_log.clear()
+
+
+def test_initialize_resets_records_not_audit():
+    m.audit("old", "n")
+    assert m.initialize() is True
+    assert m.records == {
+        1001: {"ID": 1001, "CODE": "MOD_07_A", "BAL": 150.5, "ACTIVE": True},
+        1002: {"ID": 1002, "CODE": "MOD_07_B", "BAL": 0.0, "ACTIVE": True},
+        1003: {"ID": 1003, "CODE": "MOD_07_C", "BAL": -45.2, "ACTIVE": False},
+    }
+    m.process_batch()
+    m.initialize()
+    assert m.records[1001]["BAL"] == 150.5
+    assert len(m.audit_log) == 2
+
+
+def test_validation():
+    assert not m.validate_record({})
+    assert not m.validate_record({"CODE": "X", "BAL": 1, "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "BAL": 1, "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "BAL": "1", "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "BAL": 1})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "BAL": 1, "ACTIVE": "Y"})
+    assert m.validate_record({"ID": 1, "CODE": "", "BAL": -1.5, "ACTIVE": False})
+    assert m.validate_record({"ID": 1, "CODE": None, "BAL": True, "ACTIVE": 1})
+
+
+def test_read_write_copy_upsert_and_errors():
+    assert m.read_record(9) == {"ID": 9, "FILE_STATUS": "23", "ERR_MSG": "KEY NOT FOUND"}
+    assert m.write_record({}) == 12
+    assert m.write_record({"ID": [], "CODE": "X", "BAL": 1, "ACTIVE": True}) == 12
+    rec = {"ID": 9, "CODE": "X", "BAL": 2, "ACTIVE": True, "EXTRA": "kept"}
+    assert m.write_record(rec) == 0
+    rec["BAL"] = 99
+    result = m.read_record(9)
+    assert result["BAL"] == 2
+    assert result["EXTRA"] == "kept"
+    assert result["FILE_STATUS"] == "00"
+    result["BAL"] = 88
+    assert m.records[9]["BAL"] == 2
+    assert "FILE_STATUS" not in m.records[9]
+    assert m.write_record(rec) == 0
+    assert m.read_record(9)["BAL"] == 99
+
+
+def test_surcharge_and_reconcile():
+    assert m.compute_surcharge(0) == 0
+    assert m.compute_surcharge(-10) == 0
+    assert m.compute_surcharge(100) == 105.7
+    assert m.compute_surcharge(10, 2) == 20.7
+    assert m.compute_surcharge(1.234, 1) == 1.93
+    assert m.reconcile() == {"MODULE_ID": 7, "ACTIVE_COUNT": 0, "NET_BALANCE": 0, "ADJUSTED_SURCHARGE": 0}
+    m.initialize()
+    result = m.reconcile()
+    assert result["ACTIVE_COUNT"] == 2
+    assert result["NET_BALANCE"] == 150.5
+    assert result["ADJUSTED_SURCHARGE"] == m.compute_surcharge(150.5)
+    m.records[1001]["BAL"] = -10
+    assert m.reconcile()["ADJUSTED_SURCHARGE"] == 0
+
+
+def test_audit_and_batch():
+    assert m.audit("abcdefghijklmnopq", "yes") == {"MODULE": 7, "EVENT": "ABCDEFGHIJKLMNOP", "STATUS": "Y"}
+    assert m.audit("", "") == {"MODULE": 7, "EVENT": "", "STATUS": ""}
+    assert m.process_batch() == 0
+    m.initialize()
+    assert m.process_batch() == 2
+    assert m.read_record(1001)["BAL"] == 151.75
+    assert m.read_record(1002)["BAL"] == 1.25
+    assert m.read_record(1003)["BAL"] == -45.2
+    assert m.process_batch() == 2
+    assert m.read_record(1001)["BAL"] == 153
+    assert m.audit_log[-1] == {"MODULE": 7, "EVENT": "BATCH_SWEEP", "STATUS": "Y"}
+    assert len(m.audit_log) == 5
+
+
+def test_http_contract():
+    app = FastAPI()
+    app.include_router(m.router)
+    with TestClient(app) as client:
+        assert client.post("/modules/07/initialize").json() is True
+        assert client.get("/modules/07/records/1001").json()["CODE"] == "MOD_07_A"
+        assert client.get("/modules/07/records/9").json()["FILE_STATUS"] == "23"
+        assert client.post("/modules/07/validate", json={}).json() is False
+        assert client.post("/modules/07/records", json={}).json() == 12
+        assert client.get("/modules/07/surcharge", params={"base_amt": 100}).json() == 105.7
+        assert client.get("/modules/07/reconcile").json()["MODULE_ID"] == 7
+        assert client.post("/modules/07/audit", params={"event_type": "x", "status_flg": "y"}).json()["EVENT"] == "X"
+        assert client.post("/modules/07/batch").json() == 2
+        assert client.get("/modules/07/records/invalid").status_code == 422
+        assert client.get("/modules/07/surcharge").status_code == 422
+        assert client.post("/modules/07/records", json=[]).status_code == 422
+]]></output_file>
+<output_file path="module_08.py"><![CDATA[
+"""Module 08: thread-safe, process-local storage with legacy result semantics."""
+from threading import RLock
+from typing import Any
+from fastapi import APIRouter
+
+router = APIRouter(prefix="/modules/08", tags=["08"])
+records: dict[int, dict[str, Any]] = {}
+audit_log: list[dict[str, Any]] = []
+_lock = RLock()
+
+
+@router.post("/initialize")
+def initialize() -> bool:
+    global records
+    with _lock:
+        records = {
+            1001: {"ID": 1001, "CODE": "MOD_08_A", "BAL": 150.50, "ACTIVE": True},
+            1002: {"ID": 1002, "CODE": "MOD_08_B", "BAL": 0.00, "ACTIVE": True},
+            1003: {"ID": 1003, "CODE": "MOD_08_C", "BAL": -45.20, "ACTIVE": False},
+        }
+    return True
+
+
+@router.post("/validate")
+def validate_record(rec: dict[str, Any]) -> bool:
+    if not rec or "ID" not in rec or "CODE" not in rec:
+        return False
+    return isinstance(rec.get("BAL"), (int, float)) and rec.get("ACTIVE") in (True, False)
+
+
+@router.get("/records/{rec_id}")
+def read_record(rec_id: int) -> dict[str, Any]:
+    with _lock:
+        if rec_id in records:
+            rec = dict(records[rec_id])
+            rec["FILE_STATUS"] = "00"
+            return rec
+    return {"ID": rec_id, "FILE_STATUS": "23", "ERR_MSG": "KEY NOT FOUND"}
+
+
+@router.post("/records")
+def write_record(rec: dict[str, Any]) -> int:
+    if not validate_record(rec):
+        return 12
+    with _lock:
+        try:
+            records[rec["ID"]] = dict(rec)
+        except TypeError:
+            return 12
+    return 0
+
+
+@router.get("/surcharge")
+def compute_surcharge(base_amt: float, factor: float = 1.05) -> float:
+    if base_amt <= 0.0:
+        return 0.0
+    return round(float(base_amt) * factor + 8 * 0.10, 2)
+
+
+@router.get("/reconcile")
+def reconcile() -> dict[str, Any]:
+    with _lock:
+        total = sum(r.get("BAL", 0.0) for r in records.values() if r.get("ACTIVE"))
+        return {
+            "MODULE_ID": 8,
+            "ACTIVE_COUNT": sum(1 for r in records.values() if r.get("ACTIVE")),
+            "NET_BALANCE": round(total, 2),
+            "ADJUSTED_SURCHARGE": compute_surcharge(total),
+        }
+
+
+@router.post("/audit")
+def audit(event_type: str, status_flg: str) -> dict[str, Any]:
+    entry = {"MODULE": 8, "EVENT": event_type[:16].upper(), "STATUS": status_flg[:1].upper()}
+    with _lock:
+        audit_log.append(entry)
+    return entry
+
+
+@router.post("/batch")
+def process_batch() -> int:
+    with _lock:
+        reconcile()
+        processed = 0
+        for rec in records.values():
+            if rec.get("ACTIVE"):
+                rec["BAL"] = round(rec["BAL"] + 1.25, 2)
+                processed += 1
+        audit("BATCH_SWEEP", "Y")
+        return processed
+]]></output_file>
+<output_file path="tests/test_module_08.py"><![CDATA[
+import module_08 as m
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+
+def setup_function():
+    m.records.clear()
+    m.audit_log.clear()
+
+
+def test_initialize_resets_records_not_audit():
+    m.audit("old", "n")
+    assert m.initialize() is True
+    assert m.records == {
+        1001: {"ID": 1001, "CODE": "MOD_08_A", "BAL": 150.5, "ACTIVE": True},
+        1002: {"ID": 1002, "CODE": "MOD_08_B", "BAL": 0.0, "ACTIVE": True},
+        1003: {"ID": 1003, "CODE": "MOD_08_C", "BAL": -45.2, "ACTIVE": False},
+    }
+    m.process_batch()
+    m.initialize()
+    assert m.records[1001]["BAL"] == 150.5
+    assert len(m.audit_log) == 2
+
+
+def test_validation():
+    assert not m.validate_record({})
+    assert not m.validate_record({"CODE": "X", "BAL": 1, "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "BAL": 1, "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "BAL": "1", "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "BAL": 1})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "BAL": 1, "ACTIVE": "Y"})
+    assert m.validate_record({"ID": 1, "CODE": "", "BAL": -1.5, "ACTIVE": False})
+    assert m.validate_record({"ID": 1, "CODE": None, "BAL": True, "ACTIVE": 1})
+
+
+def test_read_write_copy_upsert_and_errors():
+    assert m.read_record(9) == {"ID": 9, "FILE_STATUS": "23", "ERR_MSG": "KEY NOT FOUND"}
+    assert m.write_record({}) == 12
+    assert m.write_record({"ID": [], "CODE": "X", "BAL": 1, "ACTIVE": True}) == 12
+    rec = {"ID": 9, "CODE": "X", "BAL": 2, "ACTIVE": True, "EXTRA": "kept"}
+    assert m.write_record(rec) == 0
+    rec["BAL"] = 99
+    result = m.read_record(9)
+    assert result["BAL"] == 2
+    assert result["EXTRA"] == "kept"
+    assert result["FILE_STATUS"] == "00"
+    result["BAL"] = 88
+    assert m.records[9]["BAL"] == 2
+    assert "FILE_STATUS" not in m.records[9]
+    assert m.write_record(rec) == 0
+    assert m.read_record(9)["BAL"] == 99
+
+
+def test_surcharge_and_reconcile():
+    assert m.compute_surcharge(0) == 0
+    assert m.compute_surcharge(-10) == 0
+    assert m.compute_surcharge(100) == 105.8
+    assert m.compute_surcharge(10, 2) == 20.8
+    assert m.compute_surcharge(1.234, 1) == 2.03
+    assert m.reconcile() == {"MODULE_ID": 8, "ACTIVE_COUNT": 0, "NET_BALANCE": 0, "ADJUSTED_SURCHARGE": 0}
+    m.initialize()
+    result = m.reconcile()
+    assert result["ACTIVE_COUNT"] == 2
+    assert result["NET_BALANCE"] == 150.5
+    assert result["ADJUSTED_SURCHARGE"] == m.compute_surcharge(150.5)
+    m.records[1001]["BAL"] = -10
+    assert m.reconcile()["ADJUSTED_SURCHARGE"] == 0
+
+
+def test_audit_and_batch():
+    assert m.audit("abcdefghijklmnopq", "yes") == {"MODULE": 8, "EVENT": "ABCDEFGHIJKLMNOP", "STATUS": "Y"}
+    assert m.audit("", "") == {"MODULE": 8, "EVENT": "", "STATUS": ""}
+    assert m.process_batch() == 0
+    m.initialize()
+    assert m.process_batch() == 2
+    assert m.read_record(1001)["BAL"] == 151.75
+    assert m.read_record(1002)["BAL"] == 1.25
+    assert m.read_record(1003)["BAL"] == -45.2
+    assert m.process_batch() == 2
+    assert m.read_record(1001)["BAL"] == 153
+    assert m.audit_log[-1] == {"MODULE": 8, "EVENT": "BATCH_SWEEP", "STATUS": "Y"}
+    assert len(m.audit_log) == 5
+
+
+def test_http_contract():
+    app = FastAPI()
+    app.include_router(m.router)
+    with TestClient(app) as client:
+        assert client.post("/modules/08/initialize").json() is True
+        assert client.get("/modules/08/records/1001").json()["CODE"] == "MOD_08_A"
+        assert client.get("/modules/08/records/9").json()["FILE_STATUS"] == "23"
+        assert client.post("/modules/08/validate", json={}).json() is False
+        assert client.post("/modules/08/records", json={}).json() == 12
+        assert client.get("/modules/08/surcharge", params={"base_amt": 100}).json() == 105.8
+        assert client.get("/modules/08/reconcile").json()["MODULE_ID"] == 8
+        assert client.post("/modules/08/audit", params={"event_type": "x", "status_flg": "y"}).json()["EVENT"] == "X"
+        assert client.post("/modules/08/batch").json() == 2
+        assert client.get("/modules/08/records/invalid").status_code == 422
+        assert client.get("/modules/08/surcharge").status_code == 422
+        assert client.post("/modules/08/records", json=[]).status_code == 422
+]]></output_file>
+<output_file path="module_09.py"><![CDATA[
+"""Module 09: thread-safe, process-local storage with legacy result semantics."""
+from threading import RLock
+from typing import Any
+from fastapi import APIRouter
+
+router = APIRouter(prefix="/modules/09", tags=["09"])
+records: dict[int, dict[str, Any]] = {}
+audit_log: list[dict[str, Any]] = []
+_lock = RLock()
+
+
+@router.post("/initialize")
+def initialize() -> bool:
+    global records
+    with _lock:
+        records = {
+            1001: {"ID": 1001, "CODE": "MOD_09_A", "BAL": 150.50, "ACTIVE": True},
+            1002: {"ID": 1002, "CODE": "MOD_09_B", "BAL": 0.00, "ACTIVE": True},
+            1003: {"ID": 1003, "CODE": "MOD_09_C", "BAL": -45.20, "ACTIVE": False},
+        }
+    return True
+
+
+@router.post("/validate")
+def validate_record(rec: dict[str, Any]) -> bool:
+    if not rec or "ID" not in rec or "CODE" not in rec:
+        return False
+    return isinstance(rec.get("BAL"), (int, float)) and rec.get("ACTIVE") in (True, False)
+
+
+@router.get("/records/{rec_id}")
+def read_record(rec_id: int) -> dict[str, Any]:
+    with _lock:
+        if rec_id in records:
+            rec = dict(records[rec_id])
+            rec["FILE_STATUS"] = "00"
+            return rec
+    return {"ID": rec_id, "FILE_STATUS": "23", "ERR_MSG": "KEY NOT FOUND"}
+
+
+@router.post("/records")
+def write_record(rec: dict[str, Any]) -> int:
+    if not validate_record(rec):
+        return 12
+    with _lock:
+        try:
+            records[rec["ID"]] = dict(rec)
+        except TypeError:
+            return 12
+    return 0
+
+
+@router.get("/surcharge")
+def compute_surcharge(base_amt: float, factor: float = 1.05) -> float:
+    if base_amt <= 0.0:
+        return 0.0
+    return round(float(base_amt) * factor + 9 * 0.10, 2)
+
+
+@router.get("/reconcile")
+def reconcile() -> dict[str, Any]:
+    with _lock:
+        total = sum(r.get("BAL", 0.0) for r in records.values() if r.get("ACTIVE"))
+        return {
+            "MODULE_ID": 9,
+            "ACTIVE_COUNT": sum(1 for r in records.values() if r.get("ACTIVE")),
+            "NET_BALANCE": round(total, 2),
+            "ADJUSTED_SURCHARGE": compute_surcharge(total),
+        }
+
+
+@router.post("/audit")
+def audit(event_type: str, status_flg: str) -> dict[str, Any]:
+    entry = {"MODULE": 9, "EVENT": event_type[:16].upper(), "STATUS": status_flg[:1].upper()}
+    with _lock:
+        audit_log.append(entry)
+    return entry
+
+
+@router.post("/batch")
+def process_batch() -> int:
+    with _lock:
+        reconcile()
+        processed = 0
+        for rec in records.values():
+            if rec.get("ACTIVE"):
+                rec["BAL"] = round(rec["BAL"] + 1.25, 2)
+                processed += 1
+        audit("BATCH_SWEEP", "Y")
+        return processed
+]]></output_file>
+<output_file path="tests/test_module_09.py"><![CDATA[
+import module_09 as m
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+
+def setup_function():
+    m.records.clear()
+    m.audit_log.clear()
+
+
+def test_initialize_resets_records_not_audit():
+    m.audit("old", "n")
+    assert m.initialize() is True
+    assert m.records == {
+        1001: {"ID": 1001, "CODE": "MOD_09_A", "BAL": 150.5, "ACTIVE": True},
+        1002: {"ID": 1002, "CODE": "MOD_09_B", "BAL": 0.0, "ACTIVE": True},
+        1003: {"ID": 1003, "CODE": "MOD_09_C", "BAL": -45.2, "ACTIVE": False},
+    }
+    m.process_batch()
+    m.initialize()
+    assert m.records[1001]["BAL"] == 150.5
+    assert len(m.audit_log) == 2
+
+
+def test_validation():
+    assert not m.validate_record({})
+    assert not m.validate_record({"CODE": "X", "BAL": 1, "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "BAL": 1, "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "BAL": "1", "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "BAL": 1})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "BAL": 1, "ACTIVE": "Y"})
+    assert m.validate_record({"ID": 1, "CODE": "", "BAL": -1.5, "ACTIVE": False})
+    assert m.validate_record({"ID": 1, "CODE": None, "BAL": True, "ACTIVE": 1})
+
+
+def test_read_write_copy_upsert_and_errors():
+    assert m.read_record(9) == {"ID": 9, "FILE_STATUS": "23", "ERR_MSG": "KEY NOT FOUND"}
+    assert m.write_record({}) == 12
+    assert m.write_record({"ID": [], "CODE": "X", "BAL": 1, "ACTIVE": True}) == 12
+    rec = {"ID": 9, "CODE": "X", "BAL": 2, "ACTIVE": True, "EXTRA": "kept"}
+    assert m.write_record(rec) == 0
+    rec["BAL"] = 99
+    result = m.read_record(9)
+    assert result["BAL"] == 2
+    assert result["EXTRA"] == "kept"
+    assert result["FILE_STATUS"] == "00"
+    result["BAL"] = 88
+    assert m.records[9]["BAL"] == 2
+    assert "FILE_STATUS" not in m.records[9]
+    assert m.write_record(rec) == 0
+    assert m.read_record(9)["BAL"] == 99
+
+
+def test_surcharge_and_reconcile():
+    assert m.compute_surcharge(0) == 0
+    assert m.compute_surcharge(-10) == 0
+    assert m.compute_surcharge(100) == 105.9
+    assert m.compute_surcharge(10, 2) == 20.9
+    assert m.compute_surcharge(1.234, 1) == 2.13
+    assert m.reconcile() == {"MODULE_ID": 9, "ACTIVE_COUNT": 0, "NET_BALANCE": 0, "ADJUSTED_SURCHARGE": 0}
+    m.initialize()
+    result = m.reconcile()
+    assert result["ACTIVE_COUNT"] == 2
+    assert result["NET_BALANCE"] == 150.5
+    assert result["ADJUSTED_SURCHARGE"] == m.compute_surcharge(150.5)
+    m.records[1001]["BAL"] = -10
+    assert m.reconcile()["ADJUSTED_SURCHARGE"] == 0
+
+
+def test_audit_and_batch():
+    assert m.audit("abcdefghijklmnopq", "yes") == {"MODULE": 9, "EVENT": "ABCDEFGHIJKLMNOP", "STATUS": "Y"}
+    assert m.audit("", "") == {"MODULE": 9, "EVENT": "", "STATUS": ""}
+    assert m.process_batch() == 0
+    m.initialize()
+    assert m.process_batch() == 2
+    assert m.read_record(1001)["BAL"] == 151.75
+    assert m.read_record(1002)["BAL"] == 1.25
+    assert m.read_record(1003)["BAL"] == -45.2
+    assert m.process_batch() == 2
+    assert m.read_record(1001)["BAL"] == 153
+    assert m.audit_log[-1] == {"MODULE": 9, "EVENT": "BATCH_SWEEP", "STATUS": "Y"}
+    assert len(m.audit_log) == 5
+
+
+def test_http_contract():
+    app = FastAPI()
+    app.include_router(m.router)
+    with TestClient(app) as client:
+        assert client.post("/modules/09/initialize").json() is True
+        assert client.get("/modules/09/records/1001").json()["CODE"] == "MOD_09_A"
+        assert client.get("/modules/09/records/9").json()["FILE_STATUS"] == "23"
+        assert client.post("/modules/09/validate", json={}).json() is False
+        assert client.post("/modules/09/records", json={}).json() == 12
+        assert client.get("/modules/09/surcharge", params={"base_amt": 100}).json() == 105.9
+        assert client.get("/modules/09/reconcile").json()["MODULE_ID"] == 9
+        assert client.post("/modules/09/audit", params={"event_type": "x", "status_flg": "y"}).json()["EVENT"] == "X"
+        assert client.post("/modules/09/batch").json() == 2
+        assert client.get("/modules/09/records/invalid").status_code == 422
+        assert client.get("/modules/09/surcharge").status_code == 422
+        assert client.post("/modules/09/records", json=[]).status_code == 422
+]]></output_file>
+<output_file path="module_10.py"><![CDATA[
+"""Module 10: thread-safe, process-local storage with legacy result semantics."""
+from threading import RLock
+from typing import Any
+from fastapi import APIRouter
+
+router = APIRouter(prefix="/modules/10", tags=["10"])
+records: dict[int, dict[str, Any]] = {}
+audit_log: list[dict[str, Any]] = []
+_lock = RLock()
+
+
+@router.post("/initialize")
+def initialize() -> bool:
+    global records
+    with _lock:
+        records = {
+            1001: {"ID": 1001, "CODE": "MOD_10_A", "BAL": 150.50, "ACTIVE": True},
+            1002: {"ID": 1002, "CODE": "MOD_10_B", "BAL": 0.00, "ACTIVE": True},
+            1003: {"ID": 1003, "CODE": "MOD_10_C", "BAL": -45.20, "ACTIVE": False},
+        }
+    return True
+
+
+@router.post("/validate")
+def validate_record(rec: dict[str, Any]) -> bool:
+    if not rec or "ID" not in rec or "CODE" not in rec:
+        return False
+    return isinstance(rec.get("BAL"), (int, float)) and rec.get("ACTIVE") in (True, False)
+
+
+@router.get("/records/{rec_id}")
+def read_record(rec_id: int) -> dict[str, Any]:
+    with _lock:
+        if rec_id in records:
+            rec = dict(records[rec_id])
+            rec["FILE_STATUS"] = "00"
+            return rec
+    return {"ID": rec_id, "FILE_STATUS": "23", "ERR_MSG": "KEY NOT FOUND"}
+
+
+@router.post("/records")
+def write_record(rec: dict[str, Any]) -> int:
+    if not validate_record(rec):
+        return 12
+    with _lock:
+        try:
+            records[rec["ID"]] = dict(rec)
+        except TypeError:
+            return 12
+    return 0
+
+
+@router.get("/surcharge")
+def compute_surcharge(base_amt: float, factor: float = 1.05) -> float:
+    if base_amt <= 0.0:
+        return 0.0
+    return round(float(base_amt) * factor + 10 * 0.10, 2)
+
+
+@router.get("/reconcile")
+def reconcile() -> dict[str, Any]:
+    with _lock:
+        total = sum(r.get("BAL", 0.0) for r in records.values() if r.get("ACTIVE"))
+        return {
+            "MODULE_ID": 10,
+            "ACTIVE_COUNT": sum(1 for r in records.values() if r.get("ACTIVE")),
+            "NET_BALANCE": round(total, 2),
+            "ADJUSTED_SURCHARGE": compute_surcharge(total),
+        }
+
+
+@router.post("/audit")
+def audit(event_type: str, status_flg: str) -> dict[str, Any]:
+    entry = {"MODULE": 10, "EVENT": event_type[:16].upper(), "STATUS": status_flg[:1].upper()}
+    with _lock:
+        audit_log.append(entry)
+    return entry
+
+
+@router.post("/batch")
+def process_batch() -> int:
+    with _lock:
+        reconcile()
+        processed = 0
+        for rec in records.values():
+            if rec.get("ACTIVE"):
+                rec["BAL"] = round(rec["BAL"] + 1.25, 2)
+                processed += 1
+        audit("BATCH_SWEEP", "Y")
+        return processed
+]]></output_file>
+<output_file path="tests/test_module_10.py"><![CDATA[
+import module_10 as m
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+
+def setup_function():
+    m.records.clear()
+    m.audit_log.clear()
+
+
+def test_initialize_resets_records_not_audit():
+    m.audit("old", "n")
+    assert m.initialize() is True
+    assert m.records == {
+        1001: {"ID": 1001, "CODE": "MOD_10_A", "BAL": 150.5, "ACTIVE": True},
+        1002: {"ID": 1002, "CODE": "MOD_10_B", "BAL": 0.0, "ACTIVE": True},
+        1003: {"ID": 1003, "CODE": "MOD_10_C", "BAL": -45.2, "ACTIVE": False},
+    }
+    m.process_batch()
+    m.initialize()
+    assert m.records[1001]["BAL"] == 150.5
+    assert len(m.audit_log) == 2
+
+
+def test_validation():
+    assert not m.validate_record({})
+    assert not m.validate_record({"CODE": "X", "BAL": 1, "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "BAL": 1, "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "BAL": "1", "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "BAL": 1})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "BAL": 1, "ACTIVE": "Y"})
+    assert m.validate_record({"ID": 1, "CODE": "", "BAL": -1.5, "ACTIVE": False})
+    assert m.validate_record({"ID": 1, "CODE": None, "BAL": True, "ACTIVE": 1})
+
+
+def test_read_write_copy_upsert_and_errors():
+    assert m.read_record(9) == {"ID": 9, "FILE_STATUS": "23", "ERR_MSG": "KEY NOT FOUND"}
+    assert m.write_record({}) == 12
+    assert m.write_record({"ID": [], "CODE": "X", "BAL": 1, "ACTIVE": True}) == 12
+    rec = {"ID": 9, "CODE": "X", "BAL": 2, "ACTIVE": True, "EXTRA": "kept"}
+    assert m.write_record(rec) == 0
+    rec["BAL"] = 99
+    result = m.read_record(9)
+    assert result["BAL"] == 2
+    assert result["EXTRA"] == "kept"
+    assert result["FILE_STATUS"] == "00"
+    result["BAL"] = 88
+    assert m.records[9]["BAL"] == 2
+    assert "FILE_STATUS" not in m.records[9]
+    assert m.write_record(rec) == 0
+    assert m.read_record(9)["BAL"] == 99
+
+
+def test_surcharge_and_reconcile():
+    assert m.compute_surcharge(0) == 0
+    assert m.compute_surcharge(-10) == 0
+    assert m.compute_surcharge(100) == 106.0
+    assert m.compute_surcharge(10, 2) == 21.0
+    assert m.compute_surcharge(1.234, 1) == 2.23
+    assert m.reconcile() == {"MODULE_ID": 10, "ACTIVE_COUNT": 0, "NET_BALANCE": 0, "ADJUSTED_SURCHARGE": 0}
+    m.initialize()
+    result = m.reconcile()
+    assert result["ACTIVE_COUNT"] == 2
+    assert result["NET_BALANCE"] == 150.5
+    assert result["ADJUSTED_SURCHARGE"] == m.compute_surcharge(150.5)
+    m.records[1001]["BAL"] = -10
+    assert m.reconcile()["ADJUSTED_SURCHARGE"] == 0
+
+
+def test_audit_and_batch():
+    assert m.audit("abcdefghijklmnopq", "yes") == {"MODULE": 10, "EVENT": "ABCDEFGHIJKLMNOP", "STATUS": "Y"}
+    assert m.audit("", "") == {"MODULE": 10, "EVENT": "", "STATUS": ""}
+    assert m.process_batch() == 0
+    m.initialize()
+    assert m.process_batch() == 2
+    assert m.read_record(1001)["BAL"] == 151.75
+    assert m.read_record(1002)["BAL"] == 1.25
+    assert m.read_record(1003)["BAL"] == -45.2
+    assert m.process_batch() == 2
+    assert m.read_record(1001)["BAL"] == 153
+    assert m.audit_log[-1] == {"MODULE": 10, "EVENT": "BATCH_SWEEP", "STATUS": "Y"}
+    assert len(m.audit_log) == 5
+
+
+def test_http_contract():
+    app = FastAPI()
+    app.include_router(m.router)
+    with TestClient(app) as client:
+        assert client.post("/modules/10/initialize").json() is True
+        assert client.get("/modules/10/records/1001").json()["CODE"] == "MOD_10_A"
+        assert client.get("/modules/10/records/9").json()["FILE_STATUS"] == "23"
+        assert client.post("/modules/10/validate", json={}).json() is False
+        assert client.post("/modules/10/records", json={}).json() == 12
+        assert client.get("/modules/10/surcharge", params={"base_amt": 100}).json() == 106.0
+        assert client.get("/modules/10/reconcile").json()["MODULE_ID"] == 10
+        assert client.post("/modules/10/audit", params={"event_type": "x", "status_flg": "y"}).json()["EVENT"] == "X"
+        assert client.post("/modules/10/batch").json() == 2
+        assert client.get("/modules/10/records/invalid").status_code == 422
+        assert client.get("/modules/10/surcharge").status_code == 422
+        assert client.post("/modules/10/records", json=[]).status_code == 422
+]]></output_file>
+<output_file path="module_11.py"><![CDATA[
+"""Module 11: thread-safe, process-local storage with legacy result semantics."""
+from threading import RLock
+from typing import Any
+from fastapi import APIRouter
+
+router = APIRouter(prefix="/modules/11", tags=["11"])
+records: dict[int, dict[str, Any]] = {}
+audit_log: list[dict[str, Any]] = []
+_lock = RLock()
+
+
+@router.post("/initialize")
+def initialize() -> bool:
+    global records
+    with _lock:
+        records = {
+            1001: {"ID": 1001, "CODE": "MOD_11_A", "BAL": 150.50, "ACTIVE": True},
+            1002: {"ID": 1002, "CODE": "MOD_11_B", "BAL": 0.00, "ACTIVE": True},
+            1003: {"ID": 1003, "CODE": "MOD_11_C", "BAL": -45.20, "ACTIVE": False},
+        }
+    return True
+
+
+@router.post("/validate")
+def validate_record(rec: dict[str, Any]) -> bool:
+    if not rec or "ID" not in rec or "CODE" not in rec:
+        return False
+    return isinstance(rec.get("BAL"), (int, float)) and rec.get("ACTIVE") in (True, False)
+
+
+@router.get("/records/{rec_id}")
+def read_record(rec_id: int) -> dict[str, Any]:
+    with _lock:
+        if rec_id in records:
+            rec = dict(records[rec_id])
+            rec["FILE_STATUS"] = "00"
+            return rec
+    return {"ID": rec_id, "FILE_STATUS": "23", "ERR_MSG": "KEY NOT FOUND"}
+
+
+@router.post("/records")
+def write_record(rec: dict[str, Any]) -> int:
+    if not validate_record(rec):
+        return 12
+    with _lock:
+        try:
+            records[rec["ID"]] = dict(rec)
+        except TypeError:
+            return 12
+    return 0
+
+
+@router.get("/surcharge")
+def compute_surcharge(base_amt: float, factor: float = 1.05) -> float:
+    if base_amt <= 0.0:
+        return 0.0
+    return round(float(base_amt) * factor + 11 * 0.10, 2)
+
+
+@router.get("/reconcile")
+def reconcile() -> dict[str, Any]:
+    with _lock:
+        total = sum(r.get("BAL", 0.0) for r in records.values() if r.get("ACTIVE"))
+        return {
+            "MODULE_ID": 11,
+            "ACTIVE_COUNT": sum(1 for r in records.values() if r.get("ACTIVE")),
+            "NET_BALANCE": round(total, 2),
+            "ADJUSTED_SURCHARGE": compute_surcharge(total),
+        }
+
+
+@router.post("/audit")
+def audit(event_type: str, status_flg: str) -> dict[str, Any]:
+    entry = {"MODULE": 11, "EVENT": event_type[:16].upper(), "STATUS": status_flg[:1].upper()}
+    with _lock:
+        audit_log.append(entry)
+    return entry
+
+
+@router.post("/batch")
+def process_batch() -> int:
+    with _lock:
+        reconcile()
+        processed = 0
+        for rec in records.values():
+            if rec.get("ACTIVE"):
+                rec["BAL"] = round(rec["BAL"] + 1.25, 2)
+                processed += 1
+        audit("BATCH_SWEEP", "Y")
+        return processed
+]]></output_file>
+<output_file path="tests/test_module_11.py"><![CDATA[
+import module_11 as m
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+
+def setup_function():
+    m.records.clear()
+    m.audit_log.clear()
+
+
+def test_initialize_resets_records_not_audit():
+    m.audit("old", "n")
+    assert m.initialize() is True
+    assert m.records == {
+        1001: {"ID": 1001, "CODE": "MOD_11_A", "BAL": 150.5, "ACTIVE": True},
+        1002: {"ID": 1002, "CODE": "MOD_11_B", "BAL": 0.0, "ACTIVE": True},
+        1003: {"ID": 1003, "CODE": "MOD_11_C", "BAL": -45.2, "ACTIVE": False},
+    }
+    m.process_batch()
+    m.initialize()
+    assert m.records[1001]["BAL"] == 150.5
+    assert len(m.audit_log) == 2
+
+
+def test_validation():
+    assert not m.validate_record({})
+    assert not m.validate_record({"CODE": "X", "BAL": 1, "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "BAL": 1, "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "BAL": "1", "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "BAL": 1})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "BAL": 1, "ACTIVE": "Y"})
+    assert m.validate_record({"ID": 1, "CODE": "", "BAL": -1.5, "ACTIVE": False})
+    assert m.validate_record({"ID": 1, "CODE": None, "BAL": True, "ACTIVE": 1})
+
+
+def test_read_write_copy_upsert_and_errors():
+    assert m.read_record(9) == {"ID": 9, "FILE_STATUS": "23", "ERR_MSG": "KEY NOT FOUND"}
+    assert m.write_record({}) == 12
+    assert m.write_record({"ID": [], "CODE": "X", "BAL": 1, "ACTIVE": True}) == 12
+    rec = {"ID": 9, "CODE": "X", "BAL": 2, "ACTIVE": True, "EXTRA": "kept"}
+    assert m.write_record(rec) == 0
+    rec["BAL"] = 99
+    result = m.read_record(9)
+    assert result["BAL"] == 2
+    assert result["EXTRA"] == "kept"
+    assert result["FILE_STATUS"] == "00"
+    result["BAL"] = 88
+    assert m.records[9]["BAL"] == 2
+    assert "FILE_STATUS" not in m.records[9]
+    assert m.write_record(rec) == 0
+    assert m.read_record(9)["BAL"] == 99
+
+
+def test_surcharge_and_reconcile():
+    assert m.compute_surcharge(0) == 0
+    assert m.compute_surcharge(-10) == 0
+    assert m.compute_surcharge(100) == 106.1
+    assert m.compute_surcharge(10, 2) == 21.1
+    assert m.compute_surcharge(1.234, 1) == 2.33
+    assert m.reconcile() == {"MODULE_ID": 11, "ACTIVE_COUNT": 0, "NET_BALANCE": 0, "ADJUSTED_SURCHARGE": 0}
+    m.initialize()
+    result = m.reconcile()
+    assert result["ACTIVE_COUNT"] == 2
+    assert result["NET_BALANCE"] == 150.5
+    assert result["ADJUSTED_SURCHARGE"] == m.compute_surcharge(150.5)
+    m.records[1001]["BAL"] = -10
+    assert m.reconcile()["ADJUSTED_SURCHARGE"] == 0
+
+
+def test_audit_and_batch():
+    assert m.audit("abcdefghijklmnopq", "yes") == {"MODULE": 11, "EVENT": "ABCDEFGHIJKLMNOP", "STATUS": "Y"}
+    assert m.audit("", "") == {"MODULE": 11, "EVENT": "", "STATUS": ""}
+    assert m.process_batch() == 0
+    m.initialize()
+    assert m.process_batch() == 2
+    assert m.read_record(1001)["BAL"] == 151.75
+    assert m.read_record(1002)["BAL"] == 1.25
+    assert m.read_record(1003)["BAL"] == -45.2
+    assert m.process_batch() == 2
+    assert m.read_record(1001)["BAL"] == 153
+    assert m.audit_log[-1] == {"MODULE": 11, "EVENT": "BATCH_SWEEP", "STATUS": "Y"}
+    assert len(m.audit_log) == 5
+
+
+def test_http_contract():
+    app = FastAPI()
+    app.include_router(m.router)
+    with TestClient(app) as client:
+        assert client.post("/modules/11/initialize").json() is True
+        assert client.get("/modules/11/records/1001").json()["CODE"] == "MOD_11_A"
+        assert client.get("/modules/11/records/9").json()["FILE_STATUS"] == "23"
+        assert client.post("/modules/11/validate", json={}).json() is False
+        assert client.post("/modules/11/records", json={}).json() == 12
+        assert client.get("/modules/11/surcharge", params={"base_amt": 100}).json() == 106.1
+        assert client.get("/modules/11/reconcile").json()["MODULE_ID"] == 11
+        assert client.post("/modules/11/audit", params={"event_type": "x", "status_flg": "y"}).json()["EVENT"] == "X"
+        assert client.post("/modules/11/batch").json() == 2
+        assert client.get("/modules/11/records/invalid").status_code == 422
+        assert client.get("/modules/11/surcharge").status_code == 422
+        assert client.post("/modules/11/records", json=[]).status_code == 422
+]]></output_file>
+<output_file path="module_12.py"><![CDATA[
+"""Module 12: thread-safe, process-local storage with legacy result semantics."""
+from threading import RLock
+from typing import Any
+from fastapi import APIRouter
+
+router = APIRouter(prefix="/modules/12", tags=["12"])
+records: dict[int, dict[str, Any]] = {}
+audit_log: list[dict[str, Any]] = []
+_lock = RLock()
+
+
+@router.post("/initialize")
+def initialize() -> bool:
+    global records
+    with _lock:
+        records = {
+            1001: {"ID": 1001, "CODE": "MOD_12_A", "BAL": 150.50, "ACTIVE": True},
+            1002: {"ID": 1002, "CODE": "MOD_12_B", "BAL": 0.00, "ACTIVE": True},
+            1003: {"ID": 1003, "CODE": "MOD_12_C", "BAL": -45.20, "ACTIVE": False},
+        }
+    return True
+
+
+@router.post("/validate")
+def validate_record(rec: dict[str, Any]) -> bool:
+    if not rec or "ID" not in rec or "CODE" not in rec:
+        return False
+    return isinstance(rec.get("BAL"), (int, float)) and rec.get("ACTIVE") in (True, False)
+
+
+@router.get("/records/{rec_id}")
+def read_record(rec_id: int) -> dict[str, Any]:
+    with _lock:
+        if rec_id in records:
+            rec = dict(records[rec_id])
+            rec["FILE_STATUS"] = "00"
+            return rec
+    return {"ID": rec_id, "FILE_STATUS": "23", "ERR_MSG": "KEY NOT FOUND"}
+
+
+@router.post("/records")
+def write_record(rec: dict[str, Any]) -> int:
+    if not validate_record(rec):
+        return 12
+    with _lock:
+        try:
+            records[rec["ID"]] = dict(rec)
+        except TypeError:
+            return 12
+    return 0
+
+
+@router.get("/surcharge")
+def compute_surcharge(base_amt: float, factor: float = 1.05) -> float:
+    if base_amt <= 0.0:
+        return 0.0
+    return round(float(base_amt) * factor + 12 * 0.10, 2)
+
+
+@router.get("/reconcile")
+def reconcile() -> dict[str, Any]:
+    with _lock:
+        total = sum(r.get("BAL", 0.0) for r in records.values() if r.get("ACTIVE"))
+        return {
+            "MODULE_ID": 12,
+            "ACTIVE_COUNT": sum(1 for r in records.values() if r.get("ACTIVE")),
+            "NET_BALANCE": round(total, 2),
+            "ADJUSTED_SURCHARGE": compute_surcharge(total),
+        }
+
+
+@router.post("/audit")
+def audit(event_type: str, status_flg: str) -> dict[str, Any]:
+    entry = {"MODULE": 12, "EVENT": event_type[:16].upper(), "STATUS": status_flg[:1].upper()}
+    with _lock:
+        audit_log.append(entry)
+    return entry
+
+
+@router.post("/batch")
+def process_batch() -> int:
+    with _lock:
+        reconcile()
+        processed = 0
+        for rec in records.values():
+            if rec.get("ACTIVE"):
+                rec["BAL"] = round(rec["BAL"] + 1.25, 2)
+                processed += 1
+        audit("BATCH_SWEEP", "Y")
+        return processed
+]]></output_file>
+<output_file path="tests/test_module_12.py"><![CDATA[
+import module_12 as m
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+
+def setup_function():
+    m.records.clear()
+    m.audit_log.clear()
+
+
+def test_initialize_resets_records_not_audit():
+    m.audit("old", "n")
+    assert m.initialize() is True
+    assert m.records == {
+        1001: {"ID": 1001, "CODE": "MOD_12_A", "BAL": 150.5, "ACTIVE": True},
+        1002: {"ID": 1002, "CODE": "MOD_12_B", "BAL": 0.0, "ACTIVE": True},
+        1003: {"ID": 1003, "CODE": "MOD_12_C", "BAL": -45.2, "ACTIVE": False},
+    }
+    m.process_batch()
+    m.initialize()
+    assert m.records[1001]["BAL"] == 150.5
+    assert len(m.audit_log) == 2
+
+
+def test_validation():
+    assert not m.validate_record({})
+    assert not m.validate_record({"CODE": "X", "BAL": 1, "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "BAL": 1, "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "BAL": "1", "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "BAL": 1})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "BAL": 1, "ACTIVE": "Y"})
+    assert m.validate_record({"ID": 1, "CODE": "", "BAL": -1.5, "ACTIVE": False})
+    assert m.validate_record({"ID": 1, "CODE": None, "BAL": True, "ACTIVE": 1})
+
+
+def test_read_write_copy_upsert_and_errors():
+    assert m.read_record(9) == {"ID": 9, "FILE_STATUS": "23", "ERR_MSG": "KEY NOT FOUND"}
+    assert m.write_record({}) == 12
+    assert m.write_record({"ID": [], "CODE": "X", "BAL": 1, "ACTIVE": True}) == 12
+    rec = {"ID": 9, "CODE": "X", "BAL": 2, "ACTIVE": True, "EXTRA": "kept"}
+    assert m.write_record(rec) == 0
+    rec["BAL"] = 99
+    result = m.read_record(9)
+    assert result["BAL"] == 2
+    assert result["EXTRA"] == "kept"
+    assert result["FILE_STATUS"] == "00"
+    result["BAL"] = 88
+    assert m.records[9]["BAL"] == 2
+    assert "FILE_STATUS" not in m.records[9]
+    assert m.write_record(rec) == 0
+    assert m.read_record(9)["BAL"] == 99
+
+
+def test_surcharge_and_reconcile():
+    assert m.compute_surcharge(0) == 0
+    assert m.compute_surcharge(-10) == 0
+    assert m.compute_surcharge(100) == 106.2
+    assert m.compute_surcharge(10, 2) == 21.2
+    assert m.compute_surcharge(1.234, 1) == 2.43
+    assert m.reconcile() == {"MODULE_ID": 12, "ACTIVE_COUNT": 0, "NET_BALANCE": 0, "ADJUSTED_SURCHARGE": 0}
+    m.initialize()
+    result = m.reconcile()
+    assert result["ACTIVE_COUNT"] == 2
+    assert result["NET_BALANCE"] == 150.5
+    assert result["ADJUSTED_SURCHARGE"] == m.compute_surcharge(150.5)
+    m.records[1001]["BAL"] = -10
+    assert m.reconcile()["ADJUSTED_SURCHARGE"] == 0
+
+
+def test_audit_and_batch():
+    assert m.audit("abcdefghijklmnopq", "yes") == {"MODULE": 12, "EVENT": "ABCDEFGHIJKLMNOP", "STATUS": "Y"}
+    assert m.audit("", "") == {"MODULE": 12, "EVENT": "", "STATUS": ""}
+    assert m.process_batch() == 0
+    m.initialize()
+    assert m.process_batch() == 2
+    assert m.read_record(1001)["BAL"] == 151.75
+    assert m.read_record(1002)["BAL"] == 1.25
+    assert m.read_record(1003)["BAL"] == -45.2
+    assert m.process_batch() == 2
+    assert m.read_record(1001)["BAL"] == 153
+    assert m.audit_log[-1] == {"MODULE": 12, "EVENT": "BATCH_SWEEP", "STATUS": "Y"}
+    assert len(m.audit_log) == 5
+
+
+def test_http_contract():
+    app = FastAPI()
+    app.include_router(m.router)
+    with TestClient(app) as client:
+        assert client.post("/modules/12/initialize").json() is True
+        assert client.get("/modules/12/records/1001").json()["CODE"] == "MOD_12_A"
+        assert client.get("/modules/12/records/9").json()["FILE_STATUS"] == "23"
+        assert client.post("/modules/12/validate", json={}).json() is False
+        assert client.post("/modules/12/records", json={}).json() == 12
+        assert client.get("/modules/12/surcharge", params={"base_amt": 100}).json() == 106.2
+        assert client.get("/modules/12/reconcile").json()["MODULE_ID"] == 12
+        assert client.post("/modules/12/audit", params={"event_type": "x", "status_flg": "y"}).json()["EVENT"] == "X"
+        assert client.post("/modules/12/batch").json() == 2
+        assert client.get("/modules/12/records/invalid").status_code == 422
+        assert client.get("/modules/12/surcharge").status_code == 422
+        assert client.post("/modules/12/records", json=[]).status_code == 422
+]]></output_file>
+<output_file path="module_13.py"><![CDATA[
+"""Module 13: thread-safe, process-local storage with legacy result semantics."""
+from threading import RLock
+from typing import Any
+from fastapi import APIRouter
+
+router = APIRouter(prefix="/modules/13", tags=["13"])
+records: dict[int, dict[str, Any]] = {}
+audit_log: list[dict[str, Any]] = []
+_lock = RLock()
+
+
+@router.post("/initialize")
+def initialize() -> bool:
+    global records
+    with _lock:
+        records = {
+            1001: {"ID": 1001, "CODE": "MOD_13_A", "BAL": 150.50, "ACTIVE": True},
+            1002: {"ID": 1002, "CODE": "MOD_13_B", "BAL": 0.00, "ACTIVE": True},
+            1003: {"ID": 1003, "CODE": "MOD_13_C", "BAL": -45.20, "ACTIVE": False},
+        }
+    return True
+
+
+@router.post("/validate")
+def validate_record(rec: dict[str, Any]) -> bool:
+    if not rec or "ID" not in rec or "CODE" not in rec:
+        return False
+    return isinstance(rec.get("BAL"), (int, float)) and rec.get("ACTIVE") in (True, False)
+
+
+@router.get("/records/{rec_id}")
+def read_record(rec_id: int) -> dict[str, Any]:
+    with _lock:
+        if rec_id in records:
+            rec = dict(records[rec_id])
+            rec["FILE_STATUS"] = "00"
+            return rec
+    return {"ID": rec_id, "FILE_STATUS": "23", "ERR_MSG": "KEY NOT FOUND"}
+
+
+@router.post("/records")
+def write_record(rec: dict[str, Any]) -> int:
+    if not validate_record(rec):
+        return 12
+    with _lock:
+        try:
+            records[rec["ID"]] = dict(rec)
+        except TypeError:
+            return 12
+    return 0
+
+
+@router.get("/surcharge")
+def compute_surcharge(base_amt: float, factor: float = 1.05) -> float:
+    if base_amt <= 0.0:
+        return 0.0
+    return round(float(base_amt) * factor + 13 * 0.10, 2)
+
+
+@router.get("/reconcile")
+def reconcile() -> dict[str, Any]:
+    with _lock:
+        total = sum(r.get("BAL", 0.0) for r in records.values() if r.get("ACTIVE"))
+        return {
+            "MODULE_ID": 13,
+            "ACTIVE_COUNT": sum(1 for r in records.values() if r.get("ACTIVE")),
+            "NET_BALANCE": round(total, 2),
+            "ADJUSTED_SURCHARGE": compute_surcharge(total),
+        }
+
+
+@router.post("/audit")
+def audit(event_type: str, status_flg: str) -> dict[str, Any]:
+    entry = {"MODULE": 13, "EVENT": event_type[:16].upper(), "STATUS": status_flg[:1].upper()}
+    with _lock:
+        audit_log.append(entry)
+    return entry
+
+
+@router.post("/batch")
+def process_batch() -> int:
+    with _lock:
+        reconcile()
+        processed = 0
+        for rec in records.values():
+            if rec.get("ACTIVE"):
+                rec["BAL"] = round(rec["BAL"] + 1.25, 2)
+                processed += 1
+        audit("BATCH_SWEEP", "Y")
+        return processed
+]]></output_file>
+<output_file path="tests/test_module_13.py"><![CDATA[
+import module_13 as m
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+
+def setup_function():
+    m.records.clear()
+    m.audit_log.clear()
+
+
+def test_initialize_resets_records_not_audit():
+    m.audit("old", "n")
+    assert m.initialize() is True
+    assert m.records == {
+        1001: {"ID": 1001, "CODE": "MOD_13_A", "BAL": 150.5, "ACTIVE": True},
+        1002: {"ID": 1002, "CODE": "MOD_13_B", "BAL": 0.0, "ACTIVE": True},
+        1003: {"ID": 1003, "CODE": "MOD_13_C", "BAL": -45.2, "ACTIVE": False},
+    }
+    m.process_batch()
+    m.initialize()
+    assert m.records[1001]["BAL"] == 150.5
+    assert len(m.audit_log) == 2
+
+
+def test_validation():
+    assert not m.validate_record({})
+    assert not m.validate_record({"CODE": "X", "BAL": 1, "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "BAL": 1, "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "BAL": "1", "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "BAL": 1})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "BAL": 1, "ACTIVE": "Y"})
+    assert m.validate_record({"ID": 1, "CODE": "", "BAL": -1.5, "ACTIVE": False})
+    assert m.validate_record({"ID": 1, "CODE": None, "BAL": True, "ACTIVE": 1})
+
+
+def test_read_write_copy_upsert_and_errors():
+    assert m.read_record(9) == {"ID": 9, "FILE_STATUS": "23", "ERR_MSG": "KEY NOT FOUND"}
+    assert m.write_record({}) == 12
+    assert m.write_record({"ID": [], "CODE": "X", "BAL": 1, "ACTIVE": True}) == 12
+    rec = {"ID": 9, "CODE": "X", "BAL": 2, "ACTIVE": True, "EXTRA": "kept"}
+    assert m.write_record(rec) == 0
+    rec["BAL"] = 99
+    result = m.read_record(9)
+    assert result["BAL"] == 2
+    assert result["EXTRA"] == "kept"
+    assert result["FILE_STATUS"] == "00"
+    result["BAL"] = 88
+    assert m.records[9]["BAL"] == 2
+    assert "FILE_STATUS" not in m.records[9]
+    assert m.write_record(rec) == 0
+    assert m.read_record(9)["BAL"] == 99
+
+
+def test_surcharge_and_reconcile():
+    assert m.compute_surcharge(0) == 0
+    assert m.compute_surcharge(-10) == 0
+    assert m.compute_surcharge(100) == 106.3
+    assert m.compute_surcharge(10, 2) == 21.3
+    assert m.compute_surcharge(1.234, 1) == 2.53
+    assert m.reconcile() == {"MODULE_ID": 13, "ACTIVE_COUNT": 0, "NET_BALANCE": 0, "ADJUSTED_SURCHARGE": 0}
+    m.initialize()
+    result = m.reconcile()
+    assert result["ACTIVE_COUNT"] == 2
+    assert result["NET_BALANCE"] == 150.5
+    assert result["ADJUSTED_SURCHARGE"] == m.compute_surcharge(150.5)
+    m.records[1001]["BAL"] = -10
+    assert m.reconcile()["ADJUSTED_SURCHARGE"] == 0
+
+
+def test_audit_and_batch():
+    assert m.audit("abcdefghijklmnopq", "yes") == {"MODULE": 13, "EVENT": "ABCDEFGHIJKLMNOP", "STATUS": "Y"}
+    assert m.audit("", "") == {"MODULE": 13, "EVENT": "", "STATUS": ""}
+    assert m.process_batch() == 0
+    m.initialize()
+    assert m.process_batch() == 2
+    assert m.read_record(1001)["BAL"] == 151.75
+    assert m.read_record(1002)["BAL"] == 1.25
+    assert m.read_record(1003)["BAL"] == -45.2
+    assert m.process_batch() == 2
+    assert m.read_record(1001)["BAL"] == 153
+    assert m.audit_log[-1] == {"MODULE": 13, "EVENT": "BATCH_SWEEP", "STATUS": "Y"}
+    assert len(m.audit_log) == 5
+
+
+def test_http_contract():
+    app = FastAPI()
+    app.include_router(m.router)
+    with TestClient(app) as client:
+        assert client.post("/modules/13/initialize").json() is True
+        assert client.get("/modules/13/records/1001").json()["CODE"] == "MOD_13_A"
+        assert client.get("/modules/13/records/9").json()["FILE_STATUS"] == "23"
+        assert client.post("/modules/13/validate", json={}).json() is False
+        assert client.post("/modules/13/records", json={}).json() == 12
+        assert client.get("/modules/13/surcharge", params={"base_amt": 100}).json() == 106.3
+        assert client.get("/modules/13/reconcile").json()["MODULE_ID"] == 13
+        assert client.post("/modules/13/audit", params={"event_type": "x", "status_flg": "y"}).json()["EVENT"] == "X"
+        assert client.post("/modules/13/batch").json() == 2
+        assert client.get("/modules/13/records/invalid").status_code == 422
+        assert client.get("/modules/13/surcharge").status_code == 422
+        assert client.post("/modules/13/records", json=[]).status_code == 422
+]]></output_file>
+<output_file path="module_14.py"><![CDATA[
+"""Module 14: thread-safe, process-local storage with legacy result semantics."""
+from threading import RLock
+from typing import Any
+from fastapi import APIRouter
+
+router = APIRouter(prefix="/modules/14", tags=["14"])
+records: dict[int, dict[str, Any]] = {}
+audit_log: list[dict[str, Any]] = []
+_lock = RLock()
+
+
+@router.post("/initialize")
+def initialize() -> bool:
+    global records
+    with _lock:
+        records = {
+            1001: {"ID": 1001, "CODE": "MOD_14_A", "BAL": 150.50, "ACTIVE": True},
+            1002: {"ID": 1002, "CODE": "MOD_14_B", "BAL": 0.00, "ACTIVE": True},
+            1003: {"ID": 1003, "CODE": "MOD_14_C", "BAL": -45.20, "ACTIVE": False},
+        }
+    return True
+
+
+@router.post("/validate")
+def validate_record(rec: dict[str, Any]) -> bool:
+    if not rec or "ID" not in rec or "CODE" not in rec:
+        return False
+    return isinstance(rec.get("BAL"), (int, float)) and rec.get("ACTIVE") in (True, False)
+
+
+@router.get("/records/{rec_id}")
+def read_record(rec_id: int) -> dict[str, Any]:
+    with _lock:
+        if rec_id in records:
+            rec = dict(records[rec_id])
+            rec["FILE_STATUS"] = "00"
+            return rec
+    return {"ID": rec_id, "FILE_STATUS": "23", "ERR_MSG": "KEY NOT FOUND"}
+
+
+@router.post("/records")
+def write_record(rec: dict[str, Any]) -> int:
+    if not validate_record(rec):
+        return 12
+    with _lock:
+        try:
+            records[rec["ID"]] = dict(rec)
+        except TypeError:
+            return 12
+    return 0
+
+
+@router.get("/surcharge")
+def compute_surcharge(base_amt: float, factor: float = 1.05) -> float:
+    if base_amt <= 0.0:
+        return 0.0
+    return round(float(base_amt) * factor + 14 * 0.10, 2)
+
+
+@router.get("/reconcile")
+def reconcile() -> dict[str, Any]:
+    with _lock:
+        total = sum(r.get("BAL", 0.0) for r in records.values() if r.get("ACTIVE"))
+        return {
+            "MODULE_ID": 14,
+            "ACTIVE_COUNT": sum(1 for r in records.values() if r.get("ACTIVE")),
+            "NET_BALANCE": round(total, 2),
+            "ADJUSTED_SURCHARGE": compute_surcharge(total),
+        }
+
+
+@router.post("/audit")
+def audit(event_type: str, status_flg: str) -> dict[str, Any]:
+    entry = {"MODULE": 14, "EVENT": event_type[:16].upper(), "STATUS": status_flg[:1].upper()}
+    with _lock:
+        audit_log.append(entry)
+    return entry
+
+
+@router.post("/batch")
+def process_batch() -> int:
+    with _lock:
+        reconcile()
+        processed = 0
+        for rec in records.values():
+            if rec.get("ACTIVE"):
+                rec["BAL"] = round(rec["BAL"] + 1.25, 2)
+                processed += 1
+        audit("BATCH_SWEEP", "Y")
+        return processed
+]]></output_file>
+<output_file path="tests/test_module_14.py"><![CDATA[
+import module_14 as m
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+
+def setup_function():
+    m.records.clear()
+    m.audit_log.clear()
+
+
+def test_initialize_resets_records_not_audit():
+    m.audit("old", "n")
+    assert m.initialize() is True
+    assert m.records == {
+        1001: {"ID": 1001, "CODE": "MOD_14_A", "BAL": 150.5, "ACTIVE": True},
+        1002: {"ID": 1002, "CODE": "MOD_14_B", "BAL": 0.0, "ACTIVE": True},
+        1003: {"ID": 1003, "CODE": "MOD_14_C", "BAL": -45.2, "ACTIVE": False},
+    }
+    m.process_batch()
+    m.initialize()
+    assert m.records[1001]["BAL"] == 150.5
+    assert len(m.audit_log) == 2
+
+
+def test_validation():
+    assert not m.validate_record({})
+    assert not m.validate_record({"CODE": "X", "BAL": 1, "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "BAL": 1, "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "BAL": "1", "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "BAL": 1})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "BAL": 1, "ACTIVE": "Y"})
+    assert m.validate_record({"ID": 1, "CODE": "", "BAL": -1.5, "ACTIVE": False})
+    assert m.validate_record({"ID": 1, "CODE": None, "BAL": True, "ACTIVE": 1})
+
+
+def test_read_write_copy_upsert_and_errors():
+    assert m.read_record(9) == {"ID": 9, "FILE_STATUS": "23", "ERR_MSG": "KEY NOT FOUND"}
+    assert m.write_record({}) == 12
+    assert m.write_record({"ID": [], "CODE": "X", "BAL": 1, "ACTIVE": True}) == 12
+    rec = {"ID": 9, "CODE": "X", "BAL": 2, "ACTIVE": True, "EXTRA": "kept"}
+    assert m.write_record(rec) == 0
+    rec["BAL"] = 99
+    result = m.read_record(9)
+    assert result["BAL"] == 2
+    assert result["EXTRA"] == "kept"
+    assert result["FILE_STATUS"] == "00"
+    result["BAL"] = 88
+    assert m.records[9]["BAL"] == 2
+    assert "FILE_STATUS" not in m.records[9]
+    assert m.write_record(rec) == 0
+    assert m.read_record(9)["BAL"] == 99
+
+
+def test_surcharge_and_reconcile():
+    assert m.compute_surcharge(0) == 0
+    assert m.compute_surcharge(-10) == 0
+    assert m.compute_surcharge(100) == 106.4
+    assert m.compute_surcharge(10, 2) == 21.4
+    assert m.compute_surcharge(1.234, 1) == 2.63
+    assert m.reconcile() == {"MODULE_ID": 14, "ACTIVE_COUNT": 0, "NET_BALANCE": 0, "ADJUSTED_SURCHARGE": 0}
+    m.initialize()
+    result = m.reconcile()
+    assert result["ACTIVE_COUNT"] == 2
+    assert result["NET_BALANCE"] == 150.5
+    assert result["ADJUSTED_SURCHARGE"] == m.compute_surcharge(150.5)
+    m.records[1001]["BAL"] = -10
+    assert m.reconcile()["ADJUSTED_SURCHARGE"] == 0
+
+
+def test_audit_and_batch():
+    assert m.audit("abcdefghijklmnopq", "yes") == {"MODULE": 14, "EVENT": "ABCDEFGHIJKLMNOP", "STATUS": "Y"}
+    assert m.audit("", "") == {"MODULE": 14, "EVENT": "", "STATUS": ""}
+    assert m.process_batch() == 0
+    m.initialize()
+    assert m.process_batch() == 2
+    assert m.read_record(1001)["BAL"] == 151.75
+    assert m.read_record(1002)["BAL"] == 1.25
+    assert m.read_record(1003)["BAL"] == -45.2
+    assert m.process_batch() == 2
+    assert m.read_record(1001)["BAL"] == 153
+    assert m.audit_log[-1] == {"MODULE": 14, "EVENT": "BATCH_SWEEP", "STATUS": "Y"}
+    assert len(m.audit_log) == 5
+
+
+def test_http_contract():
+    app = FastAPI()
+    app.include_router(m.router)
+    with TestClient(app) as client:
+        assert client.post("/modules/14/initialize").json() is True
+        assert client.get("/modules/14/records/1001").json()["CODE"] == "MOD_14_A"
+        assert client.get("/modules/14/records/9").json()["FILE_STATUS"] == "23"
+        assert client.post("/modules/14/validate", json={}).json() is False
+        assert client.post("/modules/14/records", json={}).json() == 12
+        assert client.get("/modules/14/surcharge", params={"base_amt": 100}).json() == 106.4
+        assert client.get("/modules/14/reconcile").json()["MODULE_ID"] == 14
+        assert client.post("/modules/14/audit", params={"event_type": "x", "status_flg": "y"}).json()["EVENT"] == "X"
+        assert client.post("/modules/14/batch").json() == 2
+        assert client.get("/modules/14/records/invalid").status_code == 422
+        assert client.get("/modules/14/surcharge").status_code == 422
+        assert client.post("/modules/14/records", json=[]).status_code == 422
+]]></output_file>
+<output_file path="module_15.py"><![CDATA[
+"""Module 15: thread-safe, process-local storage with legacy result semantics."""
+from threading import RLock
+from typing import Any
+from fastapi import APIRouter
+
+router = APIRouter(prefix="/modules/15", tags=["15"])
+records: dict[int, dict[str, Any]] = {}
+audit_log: list[dict[str, Any]] = []
+_lock = RLock()
+
+
+@router.post("/initialize")
+def initialize() -> bool:
+    global records
+    with _lock:
+        records = {
+            1001: {"ID": 1001, "CODE": "MOD_15_A", "BAL": 150.50, "ACTIVE": True},
+            1002: {"ID": 1002, "CODE": "MOD_15_B", "BAL": 0.00, "ACTIVE": True},
+            1003: {"ID": 1003, "CODE": "MOD_15_C", "BAL": -45.20, "ACTIVE": False},
+        }
+    return True
+
+
+@router.post("/validate")
+def validate_record(rec: dict[str, Any]) -> bool:
+    if not rec or "ID" not in rec or "CODE" not in rec:
+        return False
+    return isinstance(rec.get("BAL"), (int, float)) and rec.get("ACTIVE") in (True, False)
+
+
+@router.get("/records/{rec_id}")
+def read_record(rec_id: int) -> dict[str, Any]:
+    with _lock:
+        if rec_id in records:
+            rec = dict(records[rec_id])
+            rec["FILE_STATUS"] = "00"
+            return rec
+    return {"ID": rec_id, "FILE_STATUS": "23", "ERR_MSG": "KEY NOT FOUND"}
+
+
+@router.post("/records")
+def write_record(rec: dict[str, Any]) -> int:
+    if not validate_record(rec):
+        return 12
+    with _lock:
+        try:
+            records[rec["ID"]] = dict(rec)
+        except TypeError:
+            return 12
+    return 0
+
+
+@router.get("/surcharge")
+def compute_surcharge(base_amt: float, factor: float = 1.05) -> float:
+    if base_amt <= 0.0:
+        return 0.0
+    return round(float(base_amt) * factor + 15 * 0.10, 2)
+
+
+@router.get("/reconcile")
+def reconcile() -> dict[str, Any]:
+    with _lock:
+        total = sum(r.get("BAL", 0.0) for r in records.values() if r.get("ACTIVE"))
+        return {
+            "MODULE_ID": 15,
+            "ACTIVE_COUNT": sum(1 for r in records.values() if r.get("ACTIVE")),
+            "NET_BALANCE": round(total, 2),
+            "ADJUSTED_SURCHARGE": compute_surcharge(total),
+        }
+
+
+@router.post("/audit")
+def audit(event_type: str, status_flg: str) -> dict[str, Any]:
+    entry = {"MODULE": 15, "EVENT": event_type[:16].upper(), "STATUS": status_flg[:1].upper()}
+    with _lock:
+        audit_log.append(entry)
+    return entry
+
+
+@router.post("/batch")
+def process_batch() -> int:
+    with _lock:
+        reconcile()
+        processed = 0
+        for rec in records.values():
+            if rec.get("ACTIVE"):
+                rec["BAL"] = round(rec["BAL"] + 1.25, 2)
+                processed += 1
+        audit("BATCH_SWEEP", "Y")
+        return processed
+]]></output_file>
+<output_file path="tests/test_module_15.py"><![CDATA[
+import module_15 as m
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+
+def setup_function():
+    m.records.clear()
+    m.audit_log.clear()
+
+
+def test_initialize_resets_records_not_audit():
+    m.audit("old", "n")
+    assert m.initialize() is True
+    assert m.records == {
+        1001: {"ID": 1001, "CODE": "MOD_15_A", "BAL": 150.5, "ACTIVE": True},
+        1002: {"ID": 1002, "CODE": "MOD_15_B", "BAL": 0.0, "ACTIVE": True},
+        1003: {"ID": 1003, "CODE": "MOD_15_C", "BAL": -45.2, "ACTIVE": False},
+    }
+    m.process_batch()
+    m.initialize()
+    assert m.records[1001]["BAL"] == 150.5
+    assert len(m.audit_log) == 2
+
+
+def test_validation():
+    assert not m.validate_record({})
+    assert not m.validate_record({"CODE": "X", "BAL": 1, "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "BAL": 1, "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "BAL": "1", "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "BAL": 1})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "BAL": 1, "ACTIVE": "Y"})
+    assert m.validate_record({"ID": 1, "CODE": "", "BAL": -1.5, "ACTIVE": False})
+    assert m.validate_record({"ID": 1, "CODE": None, "BAL": True, "ACTIVE": 1})
+
+
+def test_read_write_copy_upsert_and_errors():
+    assert m.read_record(9) == {"ID": 9, "FILE_STATUS": "23", "ERR_MSG": "KEY NOT FOUND"}
+    assert m.write_record({}) == 12
+    assert m.write_record({"ID": [], "CODE": "X", "BAL": 1, "ACTIVE": True}) == 12
+    rec = {"ID": 9, "CODE": "X", "BAL": 2, "ACTIVE": True, "EXTRA": "kept"}
+    assert m.write_record(rec) == 0
+    rec["BAL"] = 99
+    result = m.read_record(9)
+    assert result["BAL"] == 2
+    assert result["EXTRA"] == "kept"
+    assert result["FILE_STATUS"] == "00"
+    result["BAL"] = 88
+    assert m.records[9]["BAL"] == 2
+    assert "FILE_STATUS" not in m.records[9]
+    assert m.write_record(rec) == 0
+    assert m.read_record(9)["BAL"] == 99
+
+
+def test_surcharge_and_reconcile():
+    assert m.compute_surcharge(0) == 0
+    assert m.compute_surcharge(-10) == 0
+    assert m.compute_surcharge(100) == 106.5
+    assert m.compute_surcharge(10, 2) == 21.5
+    assert m.compute_surcharge(1.234, 1) == 2.73
+    assert m.reconcile() == {"MODULE_ID": 15, "ACTIVE_COUNT": 0, "NET_BALANCE": 0, "ADJUSTED_SURCHARGE": 0}
+    m.initialize()
+    result = m.reconcile()
+    assert result["ACTIVE_COUNT"] == 2
+    assert result["NET_BALANCE"] == 150.5
+    assert result["ADJUSTED_SURCHARGE"] == m.compute_surcharge(150.5)
+    m.records[1001]["BAL"] = -10
+    assert m.reconcile()["ADJUSTED_SURCHARGE"] == 0
+
+
+def test_audit_and_batch():
+    assert m.audit("abcdefghijklmnopq", "yes") == {"MODULE": 15, "EVENT": "ABCDEFGHIJKLMNOP", "STATUS": "Y"}
+    assert m.audit("", "") == {"MODULE": 15, "EVENT": "", "STATUS": ""}
+    assert m.process_batch() == 0
+    m.initialize()
+    assert m.process_batch() == 2
+    assert m.read_record(1001)["BAL"] == 151.75
+    assert m.read_record(1002)["BAL"] == 1.25
+    assert m.read_record(1003)["BAL"] == -45.2
+    assert m.process_batch() == 2
+    assert m.read_record(1001)["BAL"] == 153
+    assert m.audit_log[-1] == {"MODULE": 15, "EVENT": "BATCH_SWEEP", "STATUS": "Y"}
+    assert len(m.audit_log) == 5
+
+
+def test_http_contract():
+    app = FastAPI()
+    app.include_router(m.router)
+    with TestClient(app) as client:
+        assert client.post("/modules/15/initialize").json() is True
+        assert client.get("/modules/15/records/1001").json()["CODE"] == "MOD_15_A"
+        assert client.get("/modules/15/records/9").json()["FILE_STATUS"] == "23"
+        assert client.post("/modules/15/validate", json={}).json() is False
+        assert client.post("/modules/15/records", json={}).json() == 12
+        assert client.get("/modules/15/surcharge", params={"base_amt": 100}).json() == 106.5
+        assert client.get("/modules/15/reconcile").json()["MODULE_ID"] == 15
+        assert client.post("/modules/15/audit", params={"event_type": "x", "status_flg": "y"}).json()["EVENT"] == "X"
+        assert client.post("/modules/15/batch").json() == 2
+        assert client.get("/modules/15/records/invalid").status_code == 422
+        assert client.get("/modules/15/surcharge").status_code == 422
+        assert client.post("/modules/15/records", json=[]).status_code == 422
+]]></output_file>
+<output_file path="module_16.py"><![CDATA[
+"""Module 16: thread-safe, process-local storage with legacy result semantics."""
+from threading import RLock
+from typing import Any
+from fastapi import APIRouter
+
+router = APIRouter(prefix="/modules/16", tags=["16"])
+records: dict[int, dict[str, Any]] = {}
+audit_log: list[dict[str, Any]] = []
+_lock = RLock()
+
+
+@router.post("/initialize")
+def initialize() -> bool:
+    global records
+    with _lock:
+        records = {
+            1001: {"ID": 1001, "CODE": "MOD_16_A", "BAL": 150.50, "ACTIVE": True},
+            1002: {"ID": 1002, "CODE": "MOD_16_B", "BAL": 0.00, "ACTIVE": True},
+            1003: {"ID": 1003, "CODE": "MOD_16_C", "BAL": -45.20, "ACTIVE": False},
+        }
+    return True
+
+
+@router.post("/validate")
+def validate_record(rec: dict[str, Any]) -> bool:
+    if not rec or "ID" not in rec or "CODE" not in rec:
+        return False
+    return isinstance(rec.get("BAL"), (int, float)) and rec.get("ACTIVE") in (True, False)
+
+
+@router.get("/records/{rec_id}")
+def read_record(rec_id: int) -> dict[str, Any]:
+    with _lock:
+        if rec_id in records:
+            rec = dict(records[rec_id])
+            rec["FILE_STATUS"] = "00"
+            return rec
+    return {"ID": rec_id, "FILE_STATUS": "23", "ERR_MSG": "KEY NOT FOUND"}
+
+
+@router.post("/records")
+def write_record(rec: dict[str, Any]) -> int:
+    if not validate_record(rec):
+        return 12
+    with _lock:
+        try:
+            records[rec["ID"]] = dict(rec)
+        except TypeError:
+            return 12
+    return 0
+
+
+@router.get("/surcharge")
+def compute_surcharge(base_amt: float, factor: float = 1.05) -> float:
+    if base_amt <= 0.0:
+        return 0.0
+    return round(float(base_amt) * factor + 16 * 0.10, 2)
+
+
+@router.get("/reconcile")
+def reconcile() -> dict[str, Any]:
+    with _lock:
+        total = sum(r.get("BAL", 0.0) for r in records.values() if r.get("ACTIVE"))
+        return {
+            "MODULE_ID": 16,
+            "ACTIVE_COUNT": sum(1 for r in records.values() if r.get("ACTIVE")),
+            "NET_BALANCE": round(total, 2),
+            "ADJUSTED_SURCHARGE": compute_surcharge(total),
+        }
+
+
+@router.post("/audit")
+def audit(event_type: str, status_flg: str) -> dict[str, Any]:
+    entry = {"MODULE": 16, "EVENT": event_type[:16].upper(), "STATUS": status_flg[:1].upper()}
+    with _lock:
+        audit_log.append(entry)
+    return entry
+
+
+@router.post("/batch")
+def process_batch() -> int:
+    with _lock:
+        reconcile()
+        processed = 0
+        for rec in records.values():
+            if rec.get("ACTIVE"):
+                rec["BAL"] = round(rec["BAL"] + 1.25, 2)
+                processed += 1
+        audit("BATCH_SWEEP", "Y")
+        return processed
+]]></output_file>
+<output_file path="tests/test_module_16.py"><![CDATA[
+import module_16 as m
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+
+def setup_function():
+    m.records.clear()
+    m.audit_log.clear()
+
+
+def test_initialize_resets_records_not_audit():
+    m.audit("old", "n")
+    assert m.initialize() is True
+    assert m.records == {
+        1001: {"ID": 1001, "CODE": "MOD_16_A", "BAL": 150.5, "ACTIVE": True},
+        1002: {"ID": 1002, "CODE": "MOD_16_B", "BAL": 0.0, "ACTIVE": True},
+        1003: {"ID": 1003, "CODE": "MOD_16_C", "BAL": -45.2, "ACTIVE": False},
+    }
+    m.process_batch()
+    m.initialize()
+    assert m.records[1001]["BAL"] == 150.5
+    assert len(m.audit_log) == 2
+
+
+def test_validation():
+    assert not m.validate_record({})
+    assert not m.validate_record({"CODE": "X", "BAL": 1, "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "BAL": 1, "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "BAL": "1", "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "BAL": 1})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "BAL": 1, "ACTIVE": "Y"})
+    assert m.validate_record({"ID": 1, "CODE": "", "BAL": -1.5, "ACTIVE": False})
+    assert m.validate_record({"ID": 1, "CODE": None, "BAL": True, "ACTIVE": 1})
+
+
+def test_read_write_copy_upsert_and_errors():
+    assert m.read_record(9) == {"ID": 9, "FILE_STATUS": "23", "ERR_MSG": "KEY NOT FOUND"}
+    assert m.write_record({}) == 12
+    assert m.write_record({"ID": [], "CODE": "X", "BAL": 1, "ACTIVE": True}) == 12
+    rec = {"ID": 9, "CODE": "X", "BAL": 2, "ACTIVE": True, "EXTRA": "kept"}
+    assert m.write_record(rec) == 0
+    rec["BAL"] = 99
+    result = m.read_record(9)
+    assert result["BAL"] == 2
+    assert result["EXTRA"] == "kept"
+    assert result["FILE_STATUS"] == "00"
+    result["BAL"] = 88
+    assert m.records[9]["BAL"] == 2
+    assert "FILE_STATUS" not in m.records[9]
+    assert m.write_record(rec) == 0
+    assert m.read_record(9)["BAL"] == 99
+
+
+def test_surcharge_and_reconcile():
+    assert m.compute_surcharge(0) == 0
+    assert m.compute_surcharge(-10) == 0
+    assert m.compute_surcharge(100) == 106.6
+    assert m.compute_surcharge(10, 2) == 21.6
+    assert m.compute_surcharge(1.234, 1) == 2.83
+    assert m.reconcile() == {"MODULE_ID": 16, "ACTIVE_COUNT": 0, "NET_BALANCE": 0, "ADJUSTED_SURCHARGE": 0}
+    m.initialize()
+    result = m.reconcile()
+    assert result["ACTIVE_COUNT"] == 2
+    assert result["NET_BALANCE"] == 150.5
+    assert result["ADJUSTED_SURCHARGE"] == m.compute_surcharge(150.5)
+    m.records[1001]["BAL"] = -10
+    assert m.reconcile()["ADJUSTED_SURCHARGE"] == 0
+
+
+def test_audit_and_batch():
+    assert m.audit("abcdefghijklmnopq", "yes") == {"MODULE": 16, "EVENT": "ABCDEFGHIJKLMNOP", "STATUS": "Y"}
+    assert m.audit("", "") == {"MODULE": 16, "EVENT": "", "STATUS": ""}
+    assert m.process_batch() == 0
+    m.initialize()
+    assert m.process_batch() == 2
+    assert m.read_record(1001)["BAL"] == 151.75
+    assert m.read_record(1002)["BAL"] == 1.25
+    assert m.read_record(1003)["BAL"] == -45.2
+    assert m.process_batch() == 2
+    assert m.read_record(1001)["BAL"] == 153
+    assert m.audit_log[-1] == {"MODULE": 16, "EVENT": "BATCH_SWEEP", "STATUS": "Y"}
+    assert len(m.audit_log) == 5
+
+
+def test_http_contract():
+    app = FastAPI()
+    app.include_router(m.router)
+    with TestClient(app) as client:
+        assert client.post("/modules/16/initialize").json() is True
+        assert client.get("/modules/16/records/1001").json()["CODE"] == "MOD_16_A"
+        assert client.get("/modules/16/records/9").json()["FILE_STATUS"] == "23"
+        assert client.post("/modules/16/validate", json={}).json() is False
+        assert client.post("/modules/16/records", json={}).json() == 12
+        assert client.get("/modules/16/surcharge", params={"base_amt": 100}).json() == 106.6
+        assert client.get("/modules/16/reconcile").json()["MODULE_ID"] == 16
+        assert client.post("/modules/16/audit", params={"event_type": "x", "status_flg": "y"}).json()["EVENT"] == "X"
+        assert client.post("/modules/16/batch").json() == 2
+        assert client.get("/modules/16/records/invalid").status_code == 422
+        assert client.get("/modules/16/surcharge").status_code == 422
+        assert client.post("/modules/16/records", json=[]).status_code == 422
+]]></output_file>
+<output_file path="module_17.py"><![CDATA[
+"""Module 17: thread-safe, process-local storage with legacy result semantics."""
+from threading import RLock
+from typing import Any
+from fastapi import APIRouter
+
+router = APIRouter(prefix="/modules/17", tags=["17"])
+records: dict[int, dict[str, Any]] = {}
+audit_log: list[dict[str, Any]] = []
+_lock = RLock()
+
+
+@router.post("/initialize")
+def initialize() -> bool:
+    global records
+    with _lock:
+        records = {
+            1001: {"ID": 1001, "CODE": "MOD_17_A", "BAL": 150.50, "ACTIVE": True},
+            1002: {"ID": 1002, "CODE": "MOD_17_B", "BAL": 0.00, "ACTIVE": True},
+            1003: {"ID": 1003, "CODE": "MOD_17_C", "BAL": -45.20, "ACTIVE": False},
+        }
+    return True
+
+
+@router.post("/validate")
+def validate_record(rec: dict[str, Any]) -> bool:
+    if not rec or "ID" not in rec or "CODE" not in rec:
+        return False
+    return isinstance(rec.get("BAL"), (int, float)) and rec.get("ACTIVE") in (True, False)
+
+
+@router.get("/records/{rec_id}")
+def read_record(rec_id: int) -> dict[str, Any]:
+    with _lock:
+        if rec_id in records:
+            rec = dict(records[rec_id])
+            rec["FILE_STATUS"] = "00"
+            return rec
+    return {"ID": rec_id, "FILE_STATUS": "23", "ERR_MSG": "KEY NOT FOUND"}
+
+
+@router.post("/records")
+def write_record(rec: dict[str, Any]) -> int:
+    if not validate_record(rec):
+        return 12
+    with _lock:
+        try:
+            records[rec["ID"]] = dict(rec)
+        except TypeError:
+            return 12
+    return 0
+
+
+@router.get("/surcharge")
+def compute_surcharge(base_amt: float, factor: float = 1.05) -> float:
+    if base_amt <= 0.0:
+        return 0.0
+    return round(float(base_amt) * factor + 17 * 0.10, 2)
+
+
+@router.get("/reconcile")
+def reconcile() -> dict[str, Any]:
+    with _lock:
+        total = sum(r.get("BAL", 0.0) for r in records.values() if r.get("ACTIVE"))
+        return {
+            "MODULE_ID": 17,
+            "ACTIVE_COUNT": sum(1 for r in records.values() if r.get("ACTIVE")),
+            "NET_BALANCE": round(total, 2),
+            "ADJUSTED_SURCHARGE": compute_surcharge(total),
+        }
+
+
+@router.post("/audit")
+def audit(event_type: str, status_flg: str) -> dict[str, Any]:
+    entry = {"MODULE": 17, "EVENT": event_type[:16].upper(), "STATUS": status_flg[:1].upper()}
+    with _lock:
+        audit_log.append(entry)
+    return entry
+
+
+@router.post("/batch")
+def process_batch() -> int:
+    with _lock:
+        reconcile()
+        processed = 0
+        for rec in records.values():
+            if rec.get("ACTIVE"):
+                rec["BAL"] = round(rec["BAL"] + 1.25, 2)
+                processed += 1
+        audit("BATCH_SWEEP", "Y")
+        return processed
+]]></output_file>
+<output_file path="tests/test_module_17.py"><![CDATA[
+import module_17 as m
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+
+def setup_function():
+    m.records.clear()
+    m.audit_log.clear()
+
+
+def test_initialize_resets_records_not_audit():
+    m.audit("old", "n")
+    assert m.initialize() is True
+    assert m.records == {
+        1001: {"ID": 1001, "CODE": "MOD_17_A", "BAL": 150.5, "ACTIVE": True},
+        1002: {"ID": 1002, "CODE": "MOD_17_B", "BAL": 0.0, "ACTIVE": True},
+        1003: {"ID": 1003, "CODE": "MOD_17_C", "BAL": -45.2, "ACTIVE": False},
+    }
+    m.process_batch()
+    m.initialize()
+    assert m.records[1001]["BAL"] == 150.5
+    assert len(m.audit_log) == 2
+
+
+def test_validation():
+    assert not m.validate_record({})
+    assert not m.validate_record({"CODE": "X", "BAL": 1, "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "BAL": 1, "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "BAL": "1", "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "BAL": 1})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "BAL": 1, "ACTIVE": "Y"})
+    assert m.validate_record({"ID": 1, "CODE": "", "BAL": -1.5, "ACTIVE": False})
+    assert m.validate_record({"ID": 1, "CODE": None, "BAL": True, "ACTIVE": 1})
+
+
+def test_read_write_copy_upsert_and_errors():
+    assert m.read_record(9) == {"ID": 9, "FILE_STATUS": "23", "ERR_MSG": "KEY NOT FOUND"}
+    assert m.write_record({}) == 12
+    assert m.write_record({"ID": [], "CODE": "X", "BAL": 1, "ACTIVE": True}) == 12
+    rec = {"ID": 9, "CODE": "X", "BAL": 2, "ACTIVE": True, "EXTRA": "kept"}
+    assert m.write_record(rec) == 0
+    rec["BAL"] = 99
+    result = m.read_record(9)
+    assert result["BAL"] == 2
+    assert result["EXTRA"] == "kept"
+    assert result["FILE_STATUS"] == "00"
+    result["BAL"] = 88
+    assert m.records[9]["BAL"] == 2
+    assert "FILE_STATUS" not in m.records[9]
+    assert m.write_record(rec) == 0
+    assert m.read_record(9)["BAL"] == 99
+
+
+def test_surcharge_and_reconcile():
+    assert m.compute_surcharge(0) == 0
+    assert m.compute_surcharge(-10) == 0
+    assert m.compute_surcharge(100) == 106.7
+    assert m.compute_surcharge(10, 2) == 21.7
+    assert m.compute_surcharge(1.234, 1) == 2.93
+    assert m.reconcile() == {"MODULE_ID": 17, "ACTIVE_COUNT": 0, "NET_BALANCE": 0, "ADJUSTED_SURCHARGE": 0}
+    m.initialize()
+    result = m.reconcile()
+    assert result["ACTIVE_COUNT"] == 2
+    assert result["NET_BALANCE"] == 150.5
+    assert result["ADJUSTED_SURCHARGE"] == m.compute_surcharge(150.5)
+    m.records[1001]["BAL"] = -10
+    assert m.reconcile()["ADJUSTED_SURCHARGE"] == 0
+
+
+def test_audit_and_batch():
+    assert m.audit("abcdefghijklmnopq", "yes") == {"MODULE": 17, "EVENT": "ABCDEFGHIJKLMNOP", "STATUS": "Y"}
+    assert m.audit("", "") == {"MODULE": 17, "EVENT": "", "STATUS": ""}
+    assert m.process_batch() == 0
+    m.initialize()
+    assert m.process_batch() == 2
+    assert m.read_record(1001)["BAL"] == 151.75
+    assert m.read_record(1002)["BAL"] == 1.25
+    assert m.read_record(1003)["BAL"] == -45.2
+    assert m.process_batch() == 2
+    assert m.read_record(1001)["BAL"] == 153
+    assert m.audit_log[-1] == {"MODULE": 17, "EVENT": "BATCH_SWEEP", "STATUS": "Y"}
+    assert len(m.audit_log) == 5
+
+
+def test_http_contract():
+    app = FastAPI()
+    app.include_router(m.router)
+    with TestClient(app) as client:
+        assert client.post("/modules/17/initialize").json() is True
+        assert client.get("/modules/17/records/1001").json()["CODE"] == "MOD_17_A"
+        assert client.get("/modules/17/records/9").json()["FILE_STATUS"] == "23"
+        assert client.post("/modules/17/validate", json={}).json() is False
+        assert client.post("/modules/17/records", json={}).json() == 12
+        assert client.get("/modules/17/surcharge", params={"base_amt": 100}).json() == 106.7
+        assert client.get("/modules/17/reconcile").json()["MODULE_ID"] == 17
+        assert client.post("/modules/17/audit", params={"event_type": "x", "status_flg": "y"}).json()["EVENT"] == "X"
+        assert client.post("/modules/17/batch").json() == 2
+        assert client.get("/modules/17/records/invalid").status_code == 422
+        assert client.get("/modules/17/surcharge").status_code == 422
+        assert client.post("/modules/17/records", json=[]).status_code == 422
+]]></output_file>
+<output_file path="module_18.py"><![CDATA[
+"""Module 18: thread-safe, process-local storage with legacy result semantics."""
+from threading import RLock
+from typing import Any
+from fastapi import APIRouter
+
+router = APIRouter(prefix="/modules/18", tags=["18"])
+records: dict[int, dict[str, Any]] = {}
+audit_log: list[dict[str, Any]] = []
+_lock = RLock()
+
+
+@router.post("/initialize")
+def initialize() -> bool:
+    global records
+    with _lock:
+        records = {
+            1001: {"ID": 1001, "CODE": "MOD_18_A", "BAL": 150.50, "ACTIVE": True},
+            1002: {"ID": 1002, "CODE": "MOD_18_B", "BAL": 0.00, "ACTIVE": True},
+            1003: {"ID": 1003, "CODE": "MOD_18_C", "BAL": -45.20, "ACTIVE": False},
+        }
+    return True
+
+
+@router.post("/validate")
+def validate_record(rec: dict[str, Any]) -> bool:
+    if not rec or "ID" not in rec or "CODE" not in rec:
+        return False
+    return isinstance(rec.get("BAL"), (int, float)) and rec.get("ACTIVE") in (True, False)
+
+
+@router.get("/records/{rec_id}")
+def read_record(rec_id: int) -> dict[str, Any]:
+    with _lock:
+        if rec_id in records:
+            rec = dict(records[rec_id])
+            rec["FILE_STATUS"] = "00"
+            return rec
+    return {"ID": rec_id, "FILE_STATUS": "23", "ERR_MSG": "KEY NOT FOUND"}
+
+
+@router.post("/records")
+def write_record(rec: dict[str, Any]) -> int:
+    if not validate_record(rec):
+        return 12
+    with _lock:
+        try:
+            records[rec["ID"]] = dict(rec)
+        except TypeError:
+            return 12
+    return 0
+
+
+@router.get("/surcharge")
+def compute_surcharge(base_amt: float, factor: float = 1.05) -> float:
+    if base_amt <= 0.0:
+        return 0.0
+    return round(float(base_amt) * factor + 18 * 0.10, 2)
+
+
+@router.get("/reconcile")
+def reconcile() -> dict[str, Any]:
+    with _lock:
+        total = sum(r.get("BAL", 0.0) for r in records.values() if r.get("ACTIVE"))
+        return {
+            "MODULE_ID": 18,
+            "ACTIVE_COUNT": sum(1 for r in records.values() if r.get("ACTIVE")),
+            "NET_BALANCE": round(total, 2),
+            "ADJUSTED_SURCHARGE": compute_surcharge(total),
+        }
+
+
+@router.post("/audit")
+def audit(event_type: str, status_flg: str) -> dict[str, Any]:
+    entry = {"MODULE": 18, "EVENT": event_type[:16].upper(), "STATUS": status_flg[:1].upper()}
+    with _lock:
+        audit_log.append(entry)
+    return entry
+
+
+@router.post("/batch")
+def process_batch() -> int:
+    with _lock:
+        reconcile()
+        processed = 0
+        for rec in records.values():
+            if rec.get("ACTIVE"):
+                rec["BAL"] = round(rec["BAL"] + 1.25, 2)
+                processed += 1
+        audit("BATCH_SWEEP", "Y")
+        return processed
+]]></output_file>
+<output_file path="tests/test_module_18.py"><![CDATA[
+import module_18 as m
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+
+def setup_function():
+    m.records.clear()
+    m.audit_log.clear()
+
+
+def test_initialize_resets_records_not_audit():
+    m.audit("old", "n")
+    assert m.initialize() is True
+    assert m.records == {
+        1001: {"ID": 1001, "CODE": "MOD_18_A", "BAL": 150.5, "ACTIVE": True},
+        1002: {"ID": 1002, "CODE": "MOD_18_B", "BAL": 0.0, "ACTIVE": True},
+        1003: {"ID": 1003, "CODE": "MOD_18_C", "BAL": -45.2, "ACTIVE": False},
+    }
+    m.process_batch()
+    m.initialize()
+    assert m.records[1001]["BAL"] == 150.5
+    assert len(m.audit_log) == 2
+
+
+def test_validation():
+    assert not m.validate_record({})
+    assert not m.validate_record({"CODE": "X", "BAL": 1, "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "BAL": 1, "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "BAL": "1", "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "BAL": 1})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "BAL": 1, "ACTIVE": "Y"})
+    assert m.validate_record({"ID": 1, "CODE": "", "BAL": -1.5, "ACTIVE": False})
+    assert m.validate_record({"ID": 1, "CODE": None, "BAL": True, "ACTIVE": 1})
+
+
+def test_read_write_copy_upsert_and_errors():
+    assert m.read_record(9) == {"ID": 9, "FILE_STATUS": "23", "ERR_MSG": "KEY NOT FOUND"}
+    assert m.write_record({}) == 12
+    assert m.write_record({"ID": [], "CODE": "X", "BAL": 1, "ACTIVE": True}) == 12
+    rec = {"ID": 9, "CODE": "X", "BAL": 2, "ACTIVE": True, "EXTRA": "kept"}
+    assert m.write_record(rec) == 0
+    rec["BAL"] = 99
+    result = m.read_record(9)
+    assert result["BAL"] == 2
+    assert result["EXTRA"] == "kept"
+    assert result["FILE_STATUS"] == "00"
+    result["BAL"] = 88
+    assert m.records[9]["BAL"] == 2
+    assert "FILE_STATUS" not in m.records[9]
+    assert m.write_record(rec) == 0
+    assert m.read_record(9)["BAL"] == 99
+
+
+def test_surcharge_and_reconcile():
+    assert m.compute_surcharge(0) == 0
+    assert m.compute_surcharge(-10) == 0
+    assert m.compute_surcharge(100) == 106.8
+    assert m.compute_surcharge(10, 2) == 21.8
+    assert m.compute_surcharge(1.234, 1) == 3.03
+    assert m.reconcile() == {"MODULE_ID": 18, "ACTIVE_COUNT": 0, "NET_BALANCE": 0, "ADJUSTED_SURCHARGE": 0}
+    m.initialize()
+    result = m.reconcile()
+    assert result["ACTIVE_COUNT"] == 2
+    assert result["NET_BALANCE"] == 150.5
+    assert result["ADJUSTED_SURCHARGE"] == m.compute_surcharge(150.5)
+    m.records[1001]["BAL"] = -10
+    assert m.reconcile()["ADJUSTED_SURCHARGE"] == 0
+
+
+def test_audit_and_batch():
+    assert m.audit("abcdefghijklmnopq", "yes") == {"MODULE": 18, "EVENT": "ABCDEFGHIJKLMNOP", "STATUS": "Y"}
+    assert m.audit("", "") == {"MODULE": 18, "EVENT": "", "STATUS": ""}
+    assert m.process_batch() == 0
+    m.initialize()
+    assert m.process_batch() == 2
+    assert m.read_record(1001)["BAL"] == 151.75
+    assert m.read_record(1002)["BAL"] == 1.25
+    assert m.read_record(1003)["BAL"] == -45.2
+    assert m.process_batch() == 2
+    assert m.read_record(1001)["BAL"] == 153
+    assert m.audit_log[-1] == {"MODULE": 18, "EVENT": "BATCH_SWEEP", "STATUS": "Y"}
+    assert len(m.audit_log) == 5
+
+
+def test_http_contract():
+    app = FastAPI()
+    app.include_router(m.router)
+    with TestClient(app) as client:
+        assert client.post("/modules/18/initialize").json() is True
+        assert client.get("/modules/18/records/1001").json()["CODE"] == "MOD_18_A"
+        assert client.get("/modules/18/records/9").json()["FILE_STATUS"] == "23"
+        assert client.post("/modules/18/validate", json={}).json() is False
+        assert client.post("/modules/18/records", json={}).json() == 12
+        assert client.get("/modules/18/surcharge", params={"base_amt": 100}).json() == 106.8
+        assert client.get("/modules/18/reconcile").json()["MODULE_ID"] == 18
+        assert client.post("/modules/18/audit", params={"event_type": "x", "status_flg": "y"}).json()["EVENT"] == "X"
+        assert client.post("/modules/18/batch").json() == 2
+        assert client.get("/modules/18/records/invalid").status_code == 422
+        assert client.get("/modules/18/surcharge").status_code == 422
+        assert client.post("/modules/18/records", json=[]).status_code == 422
+]]></output_file>
+<output_file path="module_19.py"><![CDATA[
+"""Module 19: thread-safe, process-local storage with legacy result semantics."""
+from threading import RLock
+from typing import Any
+from fastapi import APIRouter
+
+router = APIRouter(prefix="/modules/19", tags=["19"])
+records: dict[int, dict[str, Any]] = {}
+audit_log: list[dict[str, Any]] = []
+_lock = RLock()
+
+
+@router.post("/initialize")
+def initialize() -> bool:
+    global records
+    with _lock:
+        records = {
+            1001: {"ID": 1001, "CODE": "MOD_19_A", "BAL": 150.50, "ACTIVE": True},
+            1002: {"ID": 1002, "CODE": "MOD_19_B", "BAL": 0.00, "ACTIVE": True},
+            1003: {"ID": 1003, "CODE": "MOD_19_C", "BAL": -45.20, "ACTIVE": False},
+        }
+    return True
+
+
+@router.post("/validate")
+def validate_record(rec: dict[str, Any]) -> bool:
+    if not rec or "ID" not in rec or "CODE" not in rec:
+        return False
+    return isinstance(rec.get("BAL"), (int, float)) and rec.get("ACTIVE") in (True, False)
+
+
+@router.get("/records/{rec_id}")
+def read_record(rec_id: int) -> dict[str, Any]:
+    with _lock:
+        if rec_id in records:
+            rec = dict(records[rec_id])
+            rec["FILE_STATUS"] = "00"
+            return rec
+    return {"ID": rec_id, "FILE_STATUS": "23", "ERR_MSG": "KEY NOT FOUND"}
+
+
+@router.post("/records")
+def write_record(rec: dict[str, Any]) -> int:
+    if not validate_record(rec):
+        return 12
+    with _lock:
+        try:
+            records[rec["ID"]] = dict(rec)
+        except TypeError:
+            return 12
+    return 0
+
+
+@router.get("/surcharge")
+def compute_surcharge(base_amt: float, factor: float = 1.05) -> float:
+    if base_amt <= 0.0:
+        return 0.0
+    return round(float(base_amt) * factor + 19 * 0.10, 2)
+
+
+@router.get("/reconcile")
+def reconcile() -> dict[str, Any]:
+    with _lock:
+        total = sum(r.get("BAL", 0.0) for r in records.values() if r.get("ACTIVE"))
+        return {
+            "MODULE_ID": 19,
+            "ACTIVE_COUNT": sum(1 for r in records.values() if r.get("ACTIVE")),
+            "NET_BALANCE": round(total, 2),
+            "ADJUSTED_SURCHARGE": compute_surcharge(total),
+        }
+
+
+@router.post("/audit")
+def audit(event_type: str, status_flg: str) -> dict[str, Any]:
+    entry = {"MODULE": 19, "EVENT": event_type[:16].upper(), "STATUS": status_flg[:1].upper()}
+    with _lock:
+        audit_log.append(entry)
+    return entry
+
+
+@router.post("/batch")
+def process_batch() -> int:
+    with _lock:
+        reconcile()
+        processed = 0
+        for rec in records.values():
+            if rec.get("ACTIVE"):
+                rec["BAL"] = round(rec["BAL"] + 1.25, 2)
+                processed += 1
+        audit("BATCH_SWEEP", "Y")
+        return processed
+]]></output_file>
+<output_file path="tests/test_module_19.py"><![CDATA[
+import module_19 as m
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+
+def setup_function():
+    m.records.clear()
+    m.audit_log.clear()
+
+
+def test_initialize_resets_records_not_audit():
+    m.audit("old", "n")
+    assert m.initialize() is True
+    assert m.records == {
+        1001: {"ID": 1001, "CODE": "MOD_19_A", "BAL": 150.5, "ACTIVE": True},
+        1002: {"ID": 1002, "CODE": "MOD_19_B", "BAL": 0.0, "ACTIVE": True},
+        1003: {"ID": 1003, "CODE": "MOD_19_C", "BAL": -45.2, "ACTIVE": False},
+    }
+    m.process_batch()
+    m.initialize()
+    assert m.records[1001]["BAL"] == 150.5
+    assert len(m.audit_log) == 2
+
+
+def test_validation():
+    assert not m.validate_record({})
+    assert not m.validate_record({"CODE": "X", "BAL": 1, "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "BAL": 1, "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "BAL": "1", "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "BAL": 1})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "BAL": 1, "ACTIVE": "Y"})
+    assert m.validate_record({"ID": 1, "CODE": "", "BAL": -1.5, "ACTIVE": False})
+    assert m.validate_record({"ID": 1, "CODE": None, "BAL": True, "ACTIVE": 1})
+
+
+def test_read_write_copy_upsert_and_errors():
+    assert m.read_record(9) == {"ID": 9, "FILE_STATUS": "23", "ERR_MSG": "KEY NOT FOUND"}
+    assert m.write_record({}) == 12
+    assert m.write_record({"ID": [], "CODE": "X", "BAL": 1, "ACTIVE": True}) == 12
+    rec = {"ID": 9, "CODE": "X", "BAL": 2, "ACTIVE": True, "EXTRA": "kept"}
+    assert m.write_record(rec) == 0
+    rec["BAL"] = 99
+    result = m.read_record(9)
+    assert result["BAL"] == 2
+    assert result["EXTRA"] == "kept"
+    assert result["FILE_STATUS"] == "00"
+    result["BAL"] = 88
+    assert m.records[9]["BAL"] == 2
+    assert "FILE_STATUS" not in m.records[9]
+    assert m.write_record(rec) == 0
+    assert m.read_record(9)["BAL"] == 99
+
+
+def test_surcharge_and_reconcile():
+    assert m.compute_surcharge(0) == 0
+    assert m.compute_surcharge(-10) == 0
+    assert m.compute_surcharge(100) == 106.9
+    assert m.compute_surcharge(10, 2) == 21.9
+    assert m.compute_surcharge(1.234, 1) == 3.13
+    assert m.reconcile() == {"MODULE_ID": 19, "ACTIVE_COUNT": 0, "NET_BALANCE": 0, "ADJUSTED_SURCHARGE": 0}
+    m.initialize()
+    result = m.reconcile()
+    assert result["ACTIVE_COUNT"] == 2
+    assert result["NET_BALANCE"] == 150.5
+    assert result["ADJUSTED_SURCHARGE"] == m.compute_surcharge(150.5)
+    m.records[1001]["BAL"] = -10
+    assert m.reconcile()["ADJUSTED_SURCHARGE"] == 0
+
+
+def test_audit_and_batch():
+    assert m.audit("abcdefghijklmnopq", "yes") == {"MODULE": 19, "EVENT": "ABCDEFGHIJKLMNOP", "STATUS": "Y"}
+    assert m.audit("", "") == {"MODULE": 19, "EVENT": "", "STATUS": ""}
+    assert m.process_batch() == 0
+    m.initialize()
+    assert m.process_batch() == 2
+    assert m.read_record(1001)["BAL"] == 151.75
+    assert m.read_record(1002)["BAL"] == 1.25
+    assert m.read_record(1003)["BAL"] == -45.2
+    assert m.process_batch() == 2
+    assert m.read_record(1001)["BAL"] == 153
+    assert m.audit_log[-1] == {"MODULE": 19, "EVENT": "BATCH_SWEEP", "STATUS": "Y"}
+    assert len(m.audit_log) == 5
+
+
+def test_http_contract():
+    app = FastAPI()
+    app.include_router(m.router)
+    with TestClient(app) as client:
+        assert client.post("/modules/19/initialize").json() is True
+        assert client.get("/modules/19/records/1001").json()["CODE"] == "MOD_19_A"
+        assert client.get("/modules/19/records/9").json()["FILE_STATUS"] == "23"
+        assert client.post("/modules/19/validate", json={}).json() is False
+        assert client.post("/modules/19/records", json={}).json() == 12
+        assert client.get("/modules/19/surcharge", params={"base_amt": 100}).json() == 106.9
+        assert client.get("/modules/19/reconcile").json()["MODULE_ID"] == 19
+        assert client.post("/modules/19/audit", params={"event_type": "x", "status_flg": "y"}).json()["EVENT"] == "X"
+        assert client.post("/modules/19/batch").json() == 2
+        assert client.get("/modules/19/records/invalid").status_code == 422
+        assert client.get("/modules/19/surcharge").status_code == 422
+        assert client.post("/modules/19/records", json=[]).status_code == 422
+]]></output_file>
+<output_file path="module_20.py"><![CDATA[
+"""Module 20: thread-safe, process-local storage with legacy result semantics."""
+from threading import RLock
+from typing import Any
+from fastapi import APIRouter
+
+router = APIRouter(prefix="/modules/20", tags=["20"])
+records: dict[int, dict[str, Any]] = {}
+audit_log: list[dict[str, Any]] = []
+_lock = RLock()
+
+
+@router.post("/initialize")
+def initialize() -> bool:
+    global records
+    with _lock:
+        records = {
+            1001: {"ID": 1001, "CODE": "MOD_20_A", "BAL": 150.50, "ACTIVE": True},
+            1002: {"ID": 1002, "CODE": "MOD_20_B", "BAL": 0.00, "ACTIVE": True},
+            1003: {"ID": 1003, "CODE": "MOD_20_C", "BAL": -45.20, "ACTIVE": False},
+        }
+    return True
+
+
+@router.post("/validate")
+def validate_record(rec: dict[str, Any]) -> bool:
+    if not rec or "ID" not in rec or "CODE" not in rec:
+        return False
+    return isinstance(rec.get("BAL"), (int, float)) and rec.get("ACTIVE") in (True, False)
+
+
+@router.get("/records/{rec_id}")
+def read_record(rec_id: int) -> dict[str, Any]:
+    with _lock:
+        if rec_id in records:
+            rec = dict(records[rec_id])
+            rec["FILE_STATUS"] = "00"
+            return rec
+    return {"ID": rec_id, "FILE_STATUS": "23", "ERR_MSG": "KEY NOT FOUND"}
+
+
+@router.post("/records")
+def write_record(rec: dict[str, Any]) -> int:
+    if not validate_record(rec):
+        return 12
+    with _lock:
+        try:
+            records[rec["ID"]] = dict(rec)
+        except TypeError:
+            return 12
+    return 0
+
+
+@router.get("/surcharge")
+def compute_surcharge(base_amt: float, factor: float = 1.05) -> float:
+    if base_amt <= 0.0:
+        return 0.0
+    return round(float(base_amt) * factor + 20 * 0.10, 2)
+
+
+@router.get("/reconcile")
+def reconcile() -> dict[str, Any]:
+    with _lock:
+        total = sum(r.get("BAL", 0.0) for r in records.values() if r.get("ACTIVE"))
+        return {
+            "MODULE_ID": 20,
+            "ACTIVE_COUNT": sum(1 for r in records.values() if r.get("ACTIVE")),
+            "NET_BALANCE": round(total, 2),
+            "ADJUSTED_SURCHARGE": compute_surcharge(total),
+        }
+
+
+@router.post("/audit")
+def audit(event_type: str, status_flg: str) -> dict[str, Any]:
+    entry = {"MODULE": 20, "EVENT": event_type[:16].upper(), "STATUS": status_flg[:1].upper()}
+    with _lock:
+        audit_log.append(entry)
+    return entry
+
+
+@router.post("/batch")
+def process_batch() -> int:
+    with _lock:
+        reconcile()
+        processed = 0
+        for rec in records.values():
+            if rec.get("ACTIVE"):
+                rec["BAL"] = round(rec["BAL"] + 1.25, 2)
+                processed += 1
+        audit("BATCH_SWEEP", "Y")
+        return processed
+]]></output_file>
+<output_file path="tests/test_module_20.py"><![CDATA[
+import module_20 as m
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+
+def setup_function():
+    m.records.clear()
+    m.audit_log.clear()
+
+
+def test_initialize_resets_records_not_audit():
+    m.audit("old", "n")
+    assert m.initialize() is True
+    assert m.records == {
+        1001: {"ID": 1001, "CODE": "MOD_20_A", "BAL": 150.5, "ACTIVE": True},
+        1002: {"ID": 1002, "CODE": "MOD_20_B", "BAL": 0.0, "ACTIVE": True},
+        1003: {"ID": 1003, "CODE": "MOD_20_C", "BAL": -45.2, "ACTIVE": False},
+    }
+    m.process_batch()
+    m.initialize()
+    assert m.records[1001]["BAL"] == 150.5
+    assert len(m.audit_log) == 2
+
+
+def test_validation():
+    assert not m.validate_record({})
+    assert not m.validate_record({"CODE": "X", "BAL": 1, "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "BAL": 1, "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "BAL": "1", "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "BAL": 1})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "BAL": 1, "ACTIVE": "Y"})
+    assert m.validate_record({"ID": 1, "CODE": "", "BAL": -1.5, "ACTIVE": False})
+    assert m.validate_record({"ID": 1, "CODE": None, "BAL": True, "ACTIVE": 1})
+
+
+def test_read_write_copy_upsert_and_errors():
+    assert m.read_record(9) == {"ID": 9, "FILE_STATUS": "23", "ERR_MSG": "KEY NOT FOUND"}
+    assert m.write_record({}) == 12
+    assert m.write_record({"ID": [], "CODE": "X", "BAL": 1, "ACTIVE": True}) == 12
+    rec = {"ID": 9, "CODE": "X", "BAL": 2, "ACTIVE": True, "EXTRA": "kept"}
+    assert m.write_record(rec) == 0
+    rec["BAL"] = 99
+    result = m.read_record(9)
+    assert result["BAL"] == 2
+    assert result["EXTRA"] == "kept"
+    assert result["FILE_STATUS"] == "00"
+    result["BAL"] = 88
+    assert m.records[9]["BAL"] == 2
+    assert "FILE_STATUS" not in m.records[9]
+    assert m.write_record(rec) == 0
+    assert m.read_record(9)["BAL"] == 99
+
+
+def test_surcharge_and_reconcile():
+    assert m.compute_surcharge(0) == 0
+    assert m.compute_surcharge(-10) == 0
+    assert m.compute_surcharge(100) == 107.0
+    assert m.compute_surcharge(10, 2) == 22.0
+    assert m.compute_surcharge(1.234, 1) == 3.23
+    assert m.reconcile() == {"MODULE_ID": 20, "ACTIVE_COUNT": 0, "NET_BALANCE": 0, "ADJUSTED_SURCHARGE": 0}
+    m.initialize()
+    result = m.reconcile()
+    assert result["ACTIVE_COUNT"] == 2
+    assert result["NET_BALANCE"] == 150.5
+    assert result["ADJUSTED_SURCHARGE"] == m.compute_surcharge(150.5)
+    m.records[1001]["BAL"] = -10
+    assert m.reconcile()["ADJUSTED_SURCHARGE"] == 0
+
+
+def test_audit_and_batch():
+    assert m.audit("abcdefghijklmnopq", "yes") == {"MODULE": 20, "EVENT": "ABCDEFGHIJKLMNOP", "STATUS": "Y"}
+    assert m.audit("", "") == {"MODULE": 20, "EVENT": "", "STATUS": ""}
+    assert m.process_batch() == 0
+    m.initialize()
+    assert m.process_batch() == 2
+    assert m.read_record(1001)["BAL"] == 151.75
+    assert m.read_record(1002)["BAL"] == 1.25
+    assert m.read_record(1003)["BAL"] == -45.2
+    assert m.process_batch() == 2
+    assert m.read_record(1001)["BAL"] == 153
+    assert m.audit_log[-1] == {"MODULE": 20, "EVENT": "BATCH_SWEEP", "STATUS": "Y"}
+    assert len(m.audit_log) == 5
+
+
+def test_http_contract():
+    app = FastAPI()
+    app.include_router(m.router)
+    with TestClient(app) as client:
+        assert client.post("/modules/20/initialize").json() is True
+        assert client.get("/modules/20/records/1001").json()["CODE"] == "MOD_20_A"
+        assert client.get("/modules/20/records/9").json()["FILE_STATUS"] == "23"
+        assert client.post("/modules/20/validate", json={}).json() is False
+        assert client.post("/modules/20/records", json={}).json() == 12
+        assert client.get("/modules/20/surcharge", params={"base_amt": 100}).json() == 107.0
+        assert client.get("/modules/20/reconcile").json()["MODULE_ID"] == 20
+        assert client.post("/modules/20/audit", params={"event_type": "x", "status_flg": "y"}).json()["EVENT"] == "X"
+        assert client.post("/modules/20/batch").json() == 2
+        assert client.get("/modules/20/records/invalid").status_code == 422
+        assert client.get("/modules/20/surcharge").status_code == 422
+        assert client.post("/modules/20/records", json=[]).status_code == 422
+]]></output_file>
+<output_file path="module_21.py"><![CDATA[
+"""Module 21: thread-safe, process-local storage with legacy result semantics."""
+from threading import RLock
+from typing import Any
+from fastapi import APIRouter
+
+router = APIRouter(prefix="/modules/21", tags=["21"])
+records: dict[int, dict[str, Any]] = {}
+audit_log: list[dict[str, Any]] = []
+_lock = RLock()
+
+
+@router.post("/initialize")
+def initialize() -> bool:
+    global records
+    with _lock:
+        records = {
+            1001: {"ID": 1001, "CODE": "MOD_21_A", "BAL": 150.50, "ACTIVE": True},
+            1002: {"ID": 1002, "CODE": "MOD_21_B", "BAL": 0.00, "ACTIVE": True},
+            1003: {"ID": 1003, "CODE": "MOD_21_C", "BAL": -45.20, "ACTIVE": False},
+        }
+    return True
+
+
+@router.post("/validate")
+def validate_record(rec: dict[str, Any]) -> bool:
+    if not rec or "ID" not in rec or "CODE" not in rec:
+        return False
+    return isinstance(rec.get("BAL"), (int, float)) and rec.get("ACTIVE") in (True, False)
+
+
+@router.get("/records/{rec_id}")
+def read_record(rec_id: int) -> dict[str, Any]:
+    with _lock:
+        if rec_id in records:
+            rec = dict(records[rec_id])
+            rec["FILE_STATUS"] = "00"
+            return rec
+    return {"ID": rec_id, "FILE_STATUS": "23", "ERR_MSG": "KEY NOT FOUND"}
+
+
+@router.post("/records")
+def write_record(rec: dict[str, Any]) -> int:
+    if not validate_record(rec):
+        return 12
+    with _lock:
+        try:
+            records[rec["ID"]] = dict(rec)
+        except TypeError:
+            return 12
+    return 0
+
+
+@router.get("/surcharge")
+def compute_surcharge(base_amt: float, factor: float = 1.05) -> float:
+    if base_amt <= 0.0:
+        return 0.0
+    return round(float(base_amt) * factor + 21 * 0.10, 2)
+
+
+@router.get("/reconcile")
+def reconcile() -> dict[str, Any]:
+    with _lock:
+        total = sum(r.get("BAL", 0.0) for r in records.values() if r.get("ACTIVE"))
+        return {
+            "MODULE_ID": 21,
+            "ACTIVE_COUNT": sum(1 for r in records.values() if r.get("ACTIVE")),
+            "NET_BALANCE": round(total, 2),
+            "ADJUSTED_SURCHARGE": compute_surcharge(total),
+        }
+
+
+@router.post("/audit")
+def audit(event_type: str, status_flg: str) -> dict[str, Any]:
+    entry = {"MODULE": 21, "EVENT": event_type[:16].upper(), "STATUS": status_flg[:1].upper()}
+    with _lock:
+        audit_log.append(entry)
+    return entry
+
+
+@router.post("/batch")
+def process_batch() -> int:
+    with _lock:
+        reconcile()
+        processed = 0
+        for rec in records.values():
+            if rec.get("ACTIVE"):
+                rec["BAL"] = round(rec["BAL"] + 1.25, 2)
+                processed += 1
+        audit("BATCH_SWEEP", "Y")
+        return processed
+]]></output_file>
+<output_file path="tests/test_module_21.py"><![CDATA[
+import module_21 as m
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+
+def setup_function():
+    m.records.clear()
+    m.audit_log.clear()
+
+
+def test_initialize_resets_records_not_audit():
+    m.audit("old", "n")
+    assert m.initialize() is True
+    assert m.records == {
+        1001: {"ID": 1001, "CODE": "MOD_21_A", "BAL": 150.5, "ACTIVE": True},
+        1002: {"ID": 1002, "CODE": "MOD_21_B", "BAL": 0.0, "ACTIVE": True},
+        1003: {"ID": 1003, "CODE": "MOD_21_C", "BAL": -45.2, "ACTIVE": False},
+    }
+    m.process_batch()
+    m.initialize()
+    assert m.records[1001]["BAL"] == 150.5
+    assert len(m.audit_log) == 2
+
+
+def test_validation():
+    assert not m.validate_record({})
+    assert not m.validate_record({"CODE": "X", "BAL": 1, "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "BAL": 1, "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "BAL": "1", "ACTIVE": True})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "BAL": 1})
+    assert not m.validate_record({"ID": 1, "CODE": "X", "BAL": 1, "ACTIVE": "Y"})
+    assert m.validate_record({"ID": 1, "CODE": "", "BAL": -1.5, "ACTIVE": False})
+    assert m.validate_record({"ID": 1, "CODE": None, "BAL": True, "ACTIVE": 1})
+
+
+def test_read_write_copy_upsert_and_errors():
+    assert m.read_record(9) == {"ID": 9, "FILE_STATUS": "23", "ERR_MSG": "KEY NOT FOUND"}
+    assert m.write_record({}) == 12
+    assert m.write_record({"ID": [], "CODE": "X", "BAL": 1, "ACTIVE": True}) == 12
+    rec = {"ID": 9, "CODE": "X", "BAL": 2, "ACTIVE": True, "EXTRA": "kept"}
+    assert m.write_record(rec) == 0
+    rec["BAL"] = 99
+    result = m.read_record(9)
+    assert result["BAL"] == 2
+    assert result["EXTRA"] == "kept"
+    assert result["FILE_STATUS"] == "00"
+    result["BAL"] = 88
+    assert m.records[9]["BAL"] == 2
+    assert "FILE_STATUS" not in m.records[9]
+    assert m.write_record(rec) == 0
+    assert m.read_record(9)["BAL"] == 99
+
+
+def test_surcharge_and_reconcile():
+    assert m.compute_surcharge(0) == 0
+    assert m.compute_surcharge(-10) == 0
+    assert m.compute_surcharge(100) == 107.1
+    assert m.compute_surcharge(10, 2) == 22.1
+    assert m.compute_surcharge(1.234, 1) == 3.33
+    assert m.reconcile() == {"MODULE_ID": 21, "ACTIVE_COUNT": 0, "NET_BALANCE": 0, "ADJUSTED_SURCHARGE": 0}
+    m.initialize()
+    result = m.reconcile()
+    assert result["ACTIVE_COUNT"] == 2
+    assert result["NET_BALANCE"] == 150.5
+    assert result["ADJUSTED_SURCHARGE"] == m.compute_surcharge(150.5)
+    m.records[1001]["BAL"] = -10
+    assert m.reconcile()["ADJUSTED_SURCHARGE"] == 0
+
+
+def test_audit_and_batch():
+    assert m.audit("abcdefghijklmnopq", "yes") == {"MODULE": 21, "EVENT": "ABCDEFGHIJKLMNOP", "STATUS": "Y"}
+    assert m.audit("", "") == {"MODULE": 21, "EVENT": "", "STATUS": ""}
+    assert m.process_batch() == 0
+    m.initialize()
+    assert m.process_batch() == 2
+    assert m.read_record(1001)["BAL"] == 151.75
+    assert m.read_record(1002)["BAL"] == 1.25
+    assert m.read_record(1003)["BAL"] == -45.2
+    assert m.process_batch() == 2
+    assert m.read_record(1001)["BAL"] == 153
+    assert m.audit_log[-1] == {"MODULE": 21, "EVENT": "BATCH_SWEEP", "STATUS": "Y"}
+    assert len(m.audit_log) == 5
+
+
+def test_http_contract():
+    app = FastAPI()
+    app.include_router(m.router)
+    with TestClient(app) as client:
+        assert client.post("/modules/21/initialize").json() is True
+        assert client.get("/modules/21/records/1001").json()["CODE"] == "MOD_21_A"
+        assert client.get("/modules/21/records/9").json()["FILE_STATUS"] == "23"
+        assert client.post("/modules/21/validate", json={}).json() is False
+        assert client.post("/modules/21/records", json={}).json() == 12
+        assert client.get("/modules/21/surcharge", params={"base_amt": 100}).json() == 107.1
+        assert client.get("/modules/21/reconcile").json()["MODULE_ID"] == 21
+        assert client.post("/modules/21/audit", params={"event_type": "x", "status_flg": "y"}).json()["EVENT"] == "X"
+        assert client.post("/modules/21/batch").json() == 2
+        assert client.get("/modules/21/records/invalid").status_code == 422
+        assert client.get("/modules/21/surcharge").status_code == 422
+        assert client.post("/modules/21/records", json=[]).status_code == 422
+]]></output_file>
+<output_file path="main.py"><![CDATA[
+"""FastAPI composition root.
+
+Run: python -m uvicorn main:app --workers 1
+Test: python -m pytest
+
+Storage remains process-local and volatile, as in the supplied module.
+Initialization is explicit and replaces records without clearing audit history.
+Deploy behind an authenticated, authorized internal gateway; initialization and
+batch endpoints are privileged operations. Multiple workers do not share data.
+
+Migration:
+INIT_MODULE_NN -> initialize
+VALIDATE_RECORD_NN -> validate_record
+READ_RECORD_NN -> read_record
+WRITE_RECORD_NN -> write_record
+COMPUTE_FEE_SURCHARGE_NN -> compute_surcharge
+RECONCILE_MODULE_BALANCES_NN -> reconcile
+AUDIT_SECURITY_LOG_NN -> audit
+PROCESS_BATCH_NN -> process_batch
+
+Unused circular imports and comment-only rule markers were removed. No supplied
+operation actually calls another module. Float arithmetic, Python rounding,
+shallow copies, permissive legacy validation and application status codes remain.
+Unhashable write keys now return 12 instead of raising TypeError. HTTP transport
+validation returns 422; application outcomes retain HTTP 200 and legacy bodies.
+"""
+from fastapi import FastAPI
+import module_00
+import module_01
+import module_02
+import module_03
+import module_04
+import module_05
+import module_06
+import module_07
+import module_08
+import module_09
+import module_10
+import module_11
+import module_12
+import module_13
+import module_14
+import module_15
+import module_16
+import module_17
+import module_18
+import module_19
+import module_20
+import module_21
+
+app = FastAPI(title="Modernized Domain Module", version="1.0.0")
+app.include_router(module_00.router)
+app.include_router(module_01.router)
+app.include_router(module_02.router)
+app.include_router(module_03.router)
+app.include_router(module_04.router)
+app.include_router(module_05.router)
+app.include_router(module_06.router)
+app.include_router(module_07.router)
+app.include_router(module_08.router)
+app.include_router(module_09.router)
+app.include_router(module_10.router)
+app.include_router(module_11.router)
+app.include_router(module_12.router)
+app.include_router(module_13.router)
+app.include_router(module_14.router)
+app.include_router(module_15.router)
+app.include_router(module_16.router)
+app.include_router(module_17.router)
+app.include_router(module_18.router)
+app.include_router(module_19.router)
+app.include_router(module_20.router)
+app.include_router(module_21.router)
+]]></output_file>
+<output_file path="tests/test_main.py"><![CDATA[
+from concurrent.futures import ThreadPoolExecutor
+from fastapi.testclient import TestClient
+from main import app
+import module_00
+import module_21
+
+
+def test_all_routers_registered():
+    with TestClient(app) as client:
+        response = client.get("/openapi.json")
+    assert response.status_code == 200
+    paths = response.json()["paths"]
+    assert len(paths) == 176
+    assert "/modules/00/reconcile" in paths
+    assert "/modules/01/reconcile" in paths
+    assert "/modules/02/reconcile" in paths
+    assert "/modules/03/reconcile" in paths
+    assert "/modules/04/reconcile" in paths
+    assert "/modules/05/reconcile" in paths
+    assert "/modules/06/reconcile" in paths
+    assert "/modules/07/reconcile" in paths
+    assert "/modules/08/reconcile" in paths
+    assert "/modules/09/reconcile" in paths
+    assert "/modules/10/reconcile" in paths
+    assert "/modules/11/reconcile" in paths
+    assert "/modules/12/reconcile" in paths
+    assert "/modules/13/reconcile" in paths
+    assert "/modules/14/reconcile" in paths
+    assert "/modules/15/reconcile" in paths
+    assert "/modules/16/reconcile" in paths
+    assert "/modules/17/reconcile" in paths
+    assert "/modules/18/reconcile" in paths
+    assert "/modules/19/reconcile" in paths
+    assert "/modules/20/reconcile" in paths
+    assert "/modules/21/reconcile" in paths
+    operations = [
+        operation["operationId"]
+        for item in paths.values()
+        for operation in item.values()
+    ]
+    assert len(operations) == len(set(operations))
+
+
+def test_module_isolation_over_http():
+    module_00.audit_log.clear()
+    module_21.audit_log.clear()
+    with TestClient(app) as client:
+        client.post("/modules/00/initialize")
+        client.post("/modules/21/initialize")
+        assert client.post("/modules/00/batch").json() == 2
+        assert client.get("/modules/00/records/1001").json()["BAL"] == 151.75
+        assert client.get("/modules/21/records/1001").json()["BAL"] == 150.5
+        rec = {"ID": 9000, "CODE": "NEW", "BAL": 4.5, "ACTIVE": True}
+        assert client.post("/modules/00/records", json=rec).json() == 0
+        assert client.get("/modules/00/records/9000").json()["BAL"] == 4.5
+        assert client.get("/modules/21/records/9000").json()["FILE_STATUS"] == "23"
+    assert len(module_00.audit_log) == 1
+    assert module_21.audit_log == []
+
+
+def test_concurrent_batches_are_serialized():
+    module_00.initialize()
+    module_00.audit_log.clear()
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        first = executor.submit(module_00.process_batch)
+        second = executor.submit(module_00.process_batch)
+        third = executor.submit(module_00.process_batch)
+        fourth = executor.submit(module_00.process_batch)
+        assert first.result(timeout=5) == 2
+        assert second.result(timeout=5) == 2
+        assert third.result(timeout=5) == 2
+        assert fourth.result(timeout=5) == 2
+    assert module_00.read_record(1001)["BAL"] == 155.5
+    assert module_00.read_record(1002)["BAL"] == 5.0
+    assert module_00.read_record(1003)["BAL"] == -45.2
+    assert len(module_00.audit_log) == 4
+]]></output_file>
+<output_file path="requirements.txt"><![CDATA[
+fastapi>=0.115,<1
+pydantic>=2.9,<3
+uvicorn>=0.30,<1
+pytest>=8.3,<9
+httpx>=0.27,<1
+]]></output_file>
+<output_file path="pytest.ini"><![CDATA[
+[pytest]
+testpaths = tests
+pythonpath = .
+addopts = -ra
+]]></output_file>

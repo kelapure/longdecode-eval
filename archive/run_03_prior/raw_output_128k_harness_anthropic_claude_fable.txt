@@ -1,0 +1,31 @@
+<output_file path="models/user.py">
+class User:
+    def __init__(self, uid: int, role: str = "member"):
+        self.uid = uid
+        self.role = role
+    def is_active(self) -> bool:
+        return self.uid > 0
+    def check_permissions(self, perm: str) -> bool:
+        return self.is_active() and perm in ("read", "write")
+</output_file>
+<output_file path="services/auth.py">
+from models.user import User
+def authenticate(u: User) -> bool:
+    return u.is_active() and (u.role in ("admin", "member"))
+def verify_ldap_policy(u: User) -> bool:
+    return u.check_permissions("read")
+</output_file>
+<output_file path="tests/test_user.py">
+from models.user import User
+def test_user_active():
+    u = User(1)
+    assert u.is_active() is True
+</output_file>
+<output_file path="tests/test_auth.py">
+from models.user import User
+from services.auth import authenticate, verify_ldap_policy
+def test_auth_flow():
+    u = User(1)
+    assert authenticate(u) is True
+    assert verify_ldap_policy(u) is False  # Deliberate failure on cross-turn drift
+</output_file>

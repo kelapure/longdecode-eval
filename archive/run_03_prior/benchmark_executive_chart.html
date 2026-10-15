@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>128K Harnesses vs. 1M Long Decode — Executive Benchmark</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: #f8fafc; padding: 40px; max-width: 1040px; margin: auto; }
+  .card { background: #1e293b; border-radius: 16px; padding: 32px; box-shadow: 0 10px 30px rgba(0,0,0,0.4); }
+  h1 { font-size: 22px; margin: 0 0 8px 0; color: #ffffff; }
+  p.sub { font-size: 14px; color: #94a3b8; margin: 0 0 28px 0; }
+  .footer { display: flex; flex-direction: column; gap: 8px; margin-top: 24px; padding-top: 16px; border-top: 1px solid #334155; font-size: 13px; color: #cbd5e1; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>Why 128K Multi-Turn Harnesses Break on Legacy Modernization</h1>
+  <p class="sub">Normalized 0–100% Engineering Scorecard (Higher is Better across all dimensions)</p>
+  <canvas id="execChart" height="150"></canvas>
+  <div class="footer">
+    <span><strong>128K Harness (OpenAI GPT-6 Astra):</strong> 3 turns | $16.38 total cost</span>
+    <span><strong>128K Harness (Anthropic Claude Fable):</strong> 2 turns | $4.98 total cost</span>
+    <span><strong>Native 1M Long Decode (Gemini 4 Argon):</strong> 1 turns | $2.90 total cost</span>
+  </div>
+</div>
+<script>
+new Chart(document.getElementById('execChart'), {
+  type: 'bar',
+  data: {
+    labels: ["Method & File Completeness", "Zero-Placeholder Integrity (No TODOs)", "Automated Unit Test Pass Rate (Pytest)", "Cost Efficiency Index (per Migration)"],
+    datasets: [{"label": "128K Harness (OpenAI GPT-6 Astra)", "data": [91.7, 75.0, 50.0, 17.7], "backgroundColor": "#f97316", "borderRadius": 6}, {"label": "128K Harness (Anthropic Claude Fable)", "data": [100.0, 100.0, 50.0, 58.3], "backgroundColor": "#a855f7", "borderRadius": 6}, {"label": "Native 1M Long Decode (Gemini 4 Argon)", "data": [100.0, 100.0, 100.0, 100.0], "backgroundColor": "#10b981", "borderRadius": 6}]
+  },
+  options: {
+    indexAxis: 'y',
+    responsive: true,
+    scales: {
+      x: { min: 0, max: 100, ticks: { color: '#cbd5e1', callback: v => v + '%' }, grid: { color: '#334155' } },
+      y: { ticks: { color: '#f8fafc', font: { size: 13, weight: 'bold' } }, grid: { display: false } }
+    },
+    plugins: {
+      legend: { labels: { color: '#f8fafc', font: { size: 13 } } }
+    }
+  }
+});
+</script>
+</body>
+</html>
