@@ -64,8 +64,8 @@ def render_perfect_run2_chart(out_png: str = "archive/run_02_massive/benchmark_e
     c_openai = "#f97316"     # Amber / Orange
     c_anthropic = "#c084fc"  # Vibrant Lavender / Purple
 
-    # 2. Strict Grid Sizing: 13.6 x 7.6 inches @ 300 DPI (Widescreen 16:9)
-    fig = plt.figure(figsize=(13.6, 7.6), dpi=300)
+    # 2. Strict Grid Sizing: 13.6 x 7.2 inches @ 300 DPI (Widescreen 16:9)
+    fig = plt.figure(figsize=(13.6, 7.2), dpi=300)
     fig.patch.set_facecolor(c_bg)
 
     # Master Left & Right Grid Margins
@@ -74,7 +74,7 @@ def render_perfect_run2_chart(out_png: str = "archive/run_02_massive/benchmark_e
 
     # Dedicated Axes Geometry (leaves exact room for y-labels and right callouts)
     # [left, bottom, width, height]
-    ax = fig.add_axes([0.235, 0.125, 0.715, 0.675])
+    ax = fig.add_axes([0.235, 0.095, 0.715, 0.725])
     ax.set_facecolor(c_card)
 
     y = np.arange(len(categories))
@@ -159,20 +159,11 @@ def render_perfect_run2_chart(out_png: str = "archive/run_02_massive/benchmark_e
         text.set_color("#f9fafb")
         text.set_fontweight("medium")
 
-    # 6. Footer Block: Snaps to EXACT X_LEFT!
-    footnote = (
-        "Run 2 Verified Receipts: Gemini 4 Argon: 1 turn, 35,369 tokens, $0.46 (100% pass)  |  "
-        "OpenAI GPT-6 Astra: 2 turns, 22,893 tokens, $1.28 (100% pass)  |  "
-        "Anthropic Claude Fable: 8 turns, 59,613 tokens, $3.31 (96.8% pass, 15 failures)\n"
-        "Independent forensic reproduction: github.com/kelapure/longdecode-eval • Zero API keys needed: run python3 verify_artifacts.py"
-    )
-    fig.text(X_LEFT, 0.025, footnote, fontsize=8.5, color=c_text_dim, ha="left", linespacing=1.38)
-
-    # 7. Render High-DPI Output
+    # 6. Render High-DPI Output
     Path(out_png).parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_png, dpi=300, facecolor=fig.get_facecolor(), edgecolor="none")
     plt.close(fig)
-    print(f"[Success] Perfectly aligned 300-DPI chart written to: {out_png}")
+    print(f"[Success] Clean, footer-free 300-DPI chart written to: {out_png}")
 
 
 if __name__ == "__main__":
