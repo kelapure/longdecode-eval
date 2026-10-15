@@ -146,6 +146,18 @@ python3 eval_long_decode_v2.py \
 
 ---
 
+## The Multi-Run Progression: All Three Runs Preserved
+
+To ensure total transparency, every stage of this benchmark has been preserved with its full scorecard, interactive HTML chart, and high-DPI image:
+
+| Benchmark Run | Payload Size | Key Finding | Artifact Links |
+| :--- | :--- | :--- | :--- |
+| **Run 1: Baseline Sample** | 3 modules (16 procedures) | Under 128K ceiling: all 3 models finish in 1 turn. Gemini is 5.4x cheaper than Anthropic. | • [Scorecard](archive/run_01_baseline/benchmark_results.md)<br>• [Interactive HTML](archive/run_01_baseline/benchmark_executive_chart.html)<br>• [Static PNG](archive/run_01_baseline/benchmark_executive_chart.png) |
+| **Run 2: Scaled Payload** | 15 modules (76 procedures) | First pagination cliff: Anthropic hits 8K ceiling 8x (8 turns, 15 pytest failures, $804K uncached token tax). Gemini finishes in 1 turn (35K tokens). | • [Scorecard](archive/run_02_massive/benchmark_results.md)<br>• [Interactive HTML](archive/run_02_massive/benchmark_executive_chart.html)<br>• [Static PNG](archive/run_02_massive/benchmark_executive_chart.png) |
+| **Run 3: Definitive Enterprise Run** | 22 modules (176 procedures) | Strict anti-shortcut constraints: Anthropic requires 3 turns (144K tokens, $3.56). Gemini streams 93K tokens in 1 pass ($1.31). | • [Scorecard](new_run/benchmark_results.md)<br>• [Interactive HTML](new_run/benchmark_executive_chart.html)<br>• [Static PNG](new_run/benchmark_executive_chart.png)<br>• [Raw API Outputs](new_run/) |
+
+---
+
 ## Repository Structure
 
 ```text
@@ -167,9 +179,9 @@ python3 eval_long_decode_v2.py \
 │   ├── raw_output_128k_harness_anthropic_claude_fable.txt
 │   └── raw_output_native_1m_long_decode_gemini_4_argon.txt
 └── archive/                       # Historical prior runs
-    ├── run_01_baseline/           # 3-module initial baseline
-    ├── run_02_massive/            # 15-module preliminary run
-    └── run_03_prior/              # 22-module preliminary run
+    ├── run_01_baseline/           # 3-module initial baseline (scorecard + charts)
+    ├── run_02_massive/            # 15-module preliminary run (scorecard + charts)
+    └── run_03_prior/              # 22-module preliminary run (pre-anti-shortcut)
 ```
 
 ---
