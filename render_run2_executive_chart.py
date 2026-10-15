@@ -86,7 +86,7 @@ def render_perfect_run2_chart(out_png: str = "archive/run_02_massive/benchmark_e
     bars_oai = ax.barh(y + offsets[1], scores_openai, bar_height * 0.85,
                        color=c_openai, edgecolor="none", label="OpenAI GPT-6 Astra (128K Harness)")
     bars_ant = ax.barh(y + offsets[2], scores_anthropic, bar_height * 0.85,
-                       color=c_anthropic, edgecolor="none", label="Anthropic Claude Sonnet 5.5 (64K Harness)")
+                       color=c_anthropic, edgecolor="none", label="Anthropic Claude Fable (128K Harness)")
 
     # Direct bar labels with guaranteed breathing room
     for i in range(len(categories)):

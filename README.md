@@ -4,7 +4,7 @@
 
 Conducted across:
 - **Google GenAI:** `gemini-4-argon` (Native 1M Long Decode)
-- **Anthropic:** `claude-sonnet-5-5` (Claude Fable, 64K Continuation Harness)
+- **Anthropic:** `claude-fable-5-1` (Claude Fable, 128K Continuation Harness)
 - **OpenAI:** `gpt-6-astra` (128K Continuation Harness)
 
 ---
@@ -14,7 +14,7 @@ Conducted across:
 When enterprise software modernization tasks exceed 50,000 output tokens, engineering teams must choose between two fundamentally different LLM architectures:
 
 1. **Native Long Decode (Gemini 4 Argon):** Single continuous streaming pass supporting up to 1,000,000 output tokens. State remains bound in global attention memory from token 1 to token 1,000,000.
-2. **Multi-Turn Pagination Harnesses (OpenAI / Anthropic):** Models stop at per-turn output ceilings (64,000 tokens on Anthropic, 128,000 on OpenAI). The harness must detect continuation points, re-feed prior outputs into prompt context, and stitch chunks together.
+2. **Multi-Turn Pagination Harnesses (OpenAI / Anthropic):** Models stop at per-turn output ceilings (64,000 to 128,000 tokens). The harness must detect continuation points, re-feed prior outputs into prompt context, and stitch chunks together.
 
 This benchmark pits these architectures against each other on an interdependent 22-module legacy codebase requiring **over 240,000 characters (~75,000–95,000 tokens)** of production Python/FastAPI code and comprehensive Pytest test suites.
 
@@ -24,9 +24,9 @@ This benchmark pits these architectures against each other on an interdependent 
 
 All three models ran concurrently against `./massive_legacy_sample` (22 interdependent legacy modules with 176 procedures).
 
-| Metric | 128K Harness (OpenAI GPT-6 Astra) | 64K Harness (Anthropic Claude Fable) | Native 1M Long Decode (Gemini 4 Argon) |
+| Metric | 128K Harness (OpenAI GPT-6 Astra) | 128K Harness (Anthropic Claude Fable) | Native 1M Long Decode (Gemini 4 Argon) |
 | :--- | :--- | :--- | :--- |
-| **Output Delivery Mode** | 1 turn (single stream) | **3 turns (hit 64K ceiling 2x)** | **1 turn (Single Continuous Pass)** |
+| **Output Delivery Mode** | 1 turn (single stream) | **3 turns (hit ceiling 2x)** | **1 turn (Single Continuous Pass)** |
 | **1. File Completeness** | **48 / 44 (100%)** | **44 / 44 (100%)** | **44 / 44 (100% — All 22 src + 22 tests)** |
 | **2. AST Function/Method Recall** | **333 / 176 (100%)** | **1,364 / 176 (100%)** | **594 / 176 (100%)** |
 | **3. Lazy Placeholders (`TODO`/`FIXME`)** | **0 stubs** | **0 stubs** | **0 stubs** |
@@ -42,7 +42,7 @@ All three models ran concurrently against `./massive_legacy_sample` (22 interdep
 
 ### 1. The Quadratic Re-Feeding Tax of Multi-Turn Harnesses
 When a codebase exceeds the model's per-turn completion limit, multi-turn continuation requires copying previous turns back into the user prompt. 
-- **Anthropic Claude Sonnet 5.5** hit its 64,000-token ceiling on Turn 1 and Turn 2.
+- **Anthropic Claude Fable** hit its token ceiling on Turn 1 and Turn 2.
 - Across 3 turns, it racked up **465,417 uncached input tokens** solely to re-read what it had already generated.
 - This pushed Anthropic's cost to **$3.56**, compared to **$1.31 on Gemini** (a **2.7x cost penalty** for the exact same input module set).
 
