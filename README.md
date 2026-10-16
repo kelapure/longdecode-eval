@@ -55,6 +55,10 @@ When a codebase exceeds the model's per-turn completion limit, multi-turn contin
 - OpenAI emitted 164,327 characters (49,996 tokens) in 1 turn, successfully generating 135 standalone unit tests (all passing).
 - OpenAI wrapped its file blocks in XML `<![CDATA[ ... ]]>` containers inside the `<output_file>` tags, which requires CDATA stripping before execution by standard Python linters or compilers.
 
+### 4. Turn Boundary Degradation & Signature Amnesia
+Multi-turn continuation does not just add latency—it actively induces functional bugs. In our 15-module run, Anthropic's test failures clustered exclusively around boundary cutoffs (immediate syntax/indentation seam bugs) and cross-turn schema drift (signature amnesia between Turn 1 declarations and Turn 7 test assertions).  
+👉 **Read the complete forensic analysis:** [`SEAM_BUGS_AND_DRIFT_ANALYSIS.md`](./SEAM_BUGS_AND_DRIFT_ANALYSIS.md)
+
 ---
 
 ## Independent Forensic Verification (Zero API Keys Needed)
