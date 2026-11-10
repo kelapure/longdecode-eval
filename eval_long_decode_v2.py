@@ -683,7 +683,7 @@ def evaluate_pipeline_output(
         extracted_files[fpath] = (code, *match.span(2))
 
     emitted_count = len(extracted_files)
-    completeness = min(1.0, emitted_count / max(1, expected_output_file_count))
+    completeness = emitted_count / max(1, expected_output_file_count)
     lazy_count = len(LAZY_PLACEHOLDER_REGEX.findall(raw))
 
     ast_valid, ast_fail, seam_bugs = 0, 0, 0
@@ -717,7 +717,7 @@ def evaluate_pipeline_output(
                 unresolved_imports += 1
 
     emitted_funcs, pytest_passed, pytest_total = run_sandbox_pytest_and_symbol_count(extracted_files)
-    func_recall = min(1.0, emitted_funcs / max(1, expected_function_count))
+    func_recall = emitted_funcs / max(1, expected_function_count)
     pytest_ratio = pytest_passed / max(1, pytest_total)
 
     raw_character_count = len(raw)

@@ -1,196 +1,164 @@
-# Long Decode Benchmark: Native 1M Streaming vs. Multi-Turn 128K/64K Harnesses
+# Measuring the Continuation-Harness Tax
 
-**An adversarial, reproducible engineering benchmark comparing single-pass 1M Long Decode against multi-turn continuation harnesses on enterprise-scale codebase modernization.**
+**What happens when a 22-module legacy rewrite needs more output than a single turn allows?**
 
-Conducted across:
-- **Google GenAI:** `gemini-4-argon` (Native 1M Long Decode)
-- **Anthropic:** `claude-fable-5-1` (Claude Fable, 128K Continuation Harness)
-- **OpenAI:** `gpt-6-astra` (128K Continuation Harness)
+This benchmark measures the overhead—in tokens, cost, and correctness—when multi-turn continuation harnesses must break a large code generation task into multiple API calls.
+
+## What This Measures
+
+When an LLM's per-turn output limit is smaller than the required output, a "continuation harness" must:
+1. Detect that output was truncated
+2. Re-feed prior context into the next turn
+3. Stitch chunks together
+4. Handle any drift between turns
+
+This benchmark quantifies that tax across three models on a 22-module legacy codebase (176 procedures, ~75,000–95,000 output tokens required).
+
+**Important limitations:**
+- **n=1**: Each model ran once. Results show a single point, not variance.
+- **Synthetic payload**: The 22-module input was generated, not from a real codebase.
+- **List prices on run date**: Costs reflect API pricing at time of run.
 
 ---
 
-## Executive Summary
+## Scorecard (Single Run, n=1)
 
-When enterprise software modernization tasks exceed 50,000 output tokens, engineering teams must choose between two fundamentally different LLM architectures:
+All metrics recomputed from committed raw outputs via `python3 verify_scorecard.py`.
 
-1. **Native Long Decode (Gemini 4 Argon):** Single continuous streaming pass supporting up to 1,000,000 output tokens. State remains bound in global attention memory from token 1 to token 1,000,000.
-2. **Multi-Turn Pagination Harnesses (OpenAI / Anthropic):** Models stop at per-turn output ceilings (64,000 to 128,000 tokens). The harness must detect continuation points, re-feed prior outputs into prompt context, and stitch chunks together.
-
-This benchmark pits these architectures against each other on an interdependent 22-module legacy codebase requiring **over 240,000 characters (~75,000–95,000 tokens)** of production Python/FastAPI code and comprehensive Pytest test suites.
-
----
-
-## Head-to-Head Scorecard (Definitive 22-Module Run)
-
-All three models ran concurrently against `./massive_legacy_sample` (22 interdependent legacy modules with 176 procedures).
-
-| Metric | 128K Harness (OpenAI GPT-6 Astra) | 128K Harness (Anthropic Claude Fable) | Native 1M Long Decode (Gemini 4 Argon) |
+| Metric | OpenAI GPT-6 Astra | Anthropic Claude Fable (64K-per-turn) | Gemini 4 Argon (1M native) |
 | :--- | :--- | :--- | :--- |
-| **Output Delivery Mode** | 1 turn (single stream) | **3 turns (hit ceiling 2x)** | **1 turn (Single Continuous Pass)** |
-| **1. File Completeness** | **48 / 44 (100%)** | **44 / 44 (100%)** | **44 / 44 (100% — All 22 src + 22 tests)** |
-| **2. AST Function/Method Recall** | **333 / 176 (100%)** | **1,364 / 176 (100%)** | **594 / 176 (100%)** |
-| **3. Lazy Placeholders (`TODO`/`FIXME`)** | **0 stubs** | **0 stubs** | **0 stubs** |
-| **4. Sandbox `pytest` Pass Rate** | **135 / 135 (100.0%)** | **990 / 990 (100.0%)** | **202 / 220 (91.8%)** *(18 float-rounding asserts)* |
-| **5. Raw Code Volume (Characters)** | **164,327 chars** (~3,423/file) | **292,063 chars** (~6,637/file) | **247,096 chars** (~5,615/file) |
-| **6. Uncached Input Tokens** | 3 tokens *(99.9% cached)* | **465,417 tokens** *(re-fed across turns)* | 187,309 tokens |
-| **7. Billed Output Tokens** | 49,996 tokens | **144,184 tokens** (64K + 64K + 16K) | **93,475 tokens** |
-| **8. Total Run Cost** | **$2.51** | **$3.56 (2.7x cost penalty)** | **$1.31 (Lowest Cost)** |
+| **Turns Required** | 1 | 3 (hit 64K ceiling twice) | 1 |
+| **Files Emitted** | 48 (44 expected + 4 extras) | 44 | 44 |
+| **Legacy Procedure Recall** | 176/176 (semantic mapping) | 176/176 | 176/176 |
+| **Non-test Functions** | 198 | 374 | 374 |
+| **Test Functions** | 135 | 990 | 220 |
+| **Pytest Pass Rate** | 135/135 (100%) | 990/990 (100%) | 202/220 (92%) |
+| **Lazy Placeholders** | 0 | 0 | 0 |
+| **Raw Code Volume** | 164,327 chars | 292,063 chars | 247,096 chars |
+| **Uncached Input Tokens** | 3 | 465,417 | 187,309 |
+| **Cached Input Tokens** | 46,516 | 562 | 0 |
+| **Output Tokens** | 49,996 | 144,184 | 93,475 |
+| **Cost** | $2.51 | $3.56 | $1.31 |
+
+### Reading the Metrics
+
+**Turns Required**: How many API calls to complete the task. More turns = more re-feeding of context.
+
+**Legacy Procedure Recall**: Of the 176 input procedures, how many appear in the output (by name matching)?
+- OpenAI Astra renamed procedures (e.g., `INIT_MODULE_00` → `initialize`). The 176/176 count uses a deterministic semantic mapping that covers the 4 renamed procedure types.
+- Anthropic and Gemini preserved the original names.
+
+**Non-test vs Test Functions**: The "333/176 (100%)" figures in the original scorecard were misleading—they divided total emitted functions (including test functions) by the 176 legacy procedures. This table separates them.
+
+**Pytest Pass Rate**: The 18 Gemini failures are assertion mismatches on float precision (e.g., `assert 158.12 == 158.125`), not structural or import errors.
 
 ---
 
-## Key Engineering Takeaways
+## The Continuation-Harness Tax
 
-### 1. The Quadratic Re-Feeding Tax of Multi-Turn Harnesses
-When a codebase exceeds the model's per-turn completion limit, multi-turn continuation requires copying previous turns back into the user prompt. 
-- **Anthropic Claude Fable** hit its token ceiling on Turn 1 and Turn 2.
-- Across 3 turns, it racked up **465,417 uncached input tokens** solely to re-read what it had already generated.
-- This pushed Anthropic's cost to **$3.56**, compared to **$1.31 on Gemini** (a **2.7x cost penalty** for the exact same input module set).
+The primary finding: **Anthropic's 3-turn run accumulated 465,417 uncached input tokens** re-feeding prior output back into context. That's the continuation tax.
 
-### 2. Gemini 4 Argon: Uninterrupted 93,475-Token Stream
-- Gemini streamed **247,096 characters of full Python 3.12 code** in a **single HTTP connection** without pagination, chunk stitching, or boundary tokens.
-- All 44 files were emitted with complete cross-module imports, dependency injection, and Pytest coverage.
-- **Why did 18 tests fail in Gemini?** A forensic audit of the 18 failed tests reveals they were 100% caused by raw Python float representation (`assert 158.12 == 158.125`) rather than architectural or import errors.
+| Model | Turns | Uncached Input Tokens | Re-fed Context Overhead |
+| :--- | :---: | ---: | :--- |
+| GPT-6 Astra | 1 | 3 | Negligible (finished in one turn) |
+| Claude Fable | 3 | 465,417 | ~270K tokens re-fed across turns |
+| Gemini 4 Argon | 1 | 187,309 | None (native 1M streaming) |
 
-### 3. OpenAI GPT-6 Astra: Code Volume & Formatting
-- OpenAI emitted 164,327 characters (49,996 tokens) in 1 turn, successfully generating 135 standalone unit tests (all passing).
-- OpenAI wrapped its file blocks in XML `<![CDATA[ ... ]]>` containers inside the `<output_file>` tags, which requires CDATA stripping before execution by standard Python linters or compilers.
-
-### 4. Turn Boundary Degradation & Signature Amnesia
-Multi-turn continuation does not just add latency—it actively induces functional bugs. In our 15-module run, Anthropic's test failures clustered exclusively around boundary cutoffs (immediate syntax/indentation seam bugs) and cross-turn schema drift (signature amnesia between Turn 1 declarations and Turn 7 test assertions).  
-👉 **Read the complete forensic analysis:** [`SEAM_BUGS_AND_DRIFT_ANALYSIS.md`](./SEAM_BUGS_AND_DRIFT_ANALYSIS.md)
+The 64K-per-turn ceiling meant Anthropic had to make 3 API calls and re-transmit growing context each time. The cost penalty was 2.7× vs. Gemini.
 
 ---
 
-## Independent Forensic Verification (Zero API Keys Needed)
+## Verify Without API Keys
 
-Fellow engineers do **not** need to take our word for it or spend API credits to audit this benchmark. 
-
-The complete, unaltered raw API responses from all three models are committed in [`new_run/`](./new_run/). You can independently extract the files, parse the AST trees, and execute pytest in isolated sandboxes in ~10 seconds:
+The raw API responses are committed. You can recompute every metric locally:
 
 ```bash
-# 1. Clone repository
 git clone https://github.com/kelapure/longdecode-eval.git
 cd longdecode-eval
 
-# 2. Set up clean Python virtual environment
-python3 -m venv .venv
-source .venv/bin/activate
+# Optional: create a venv
+python3 -m venv .venv && source .venv/bin/activate
 pip install pytest fastapi httpx
 
-# 3. Run the automated independent verification script
-python3 verify_artifacts.py --run-dir ./new_run
-```
+# Run verification
+python3 verify_scorecard.py --run-dir ./new_run
 
-### Verification Output:
-```text
-====================================================================================
-INDEPENDENT FORENSIC VERIFICATION: LONG DECODE BENCHMARK
-Target Run Directory: .../new_run
-====================================================================================
-
-Model: OpenAI GPT-6 Astra (128K Harness)
-  • Raw Output File:           raw_output_128k_harness_openai_gpt-6_astra.txt
-  • Total Code Characters:     164,327 chars
-  • Total Emitted Files:       48 files (46 Python source files)
-  • Average Chars Per File:    3,423 chars/file
-  • AST Valid Python Files:    46/46 (100.0%)
-  • AST Functions/Methods:     333 procedures declared
-  • Lazy Placeholder Stubs:    0 stubs
-  • Pytest Exit Code:          0
-  • Pytest Execution Result:   135 passed in 2.34s
-  • Verified Pytest Tally:     135 passed, 0 failed
-
-Model: Anthropic Claude Fable (64K Harness)
-  • Raw Output File:           raw_output_128k_harness_anthropic_claude_fable.txt
-  • Total Code Characters:     292,063 chars
-  • Total Emitted Files:       44 files (44 Python source files)
-  • Average Chars Per File:    6,637 chars/file
-  • AST Valid Python Files:    44/44 (100.0%)
-  • AST Functions/Methods:     1364 procedures declared
-  • Lazy Placeholder Stubs:    0 stubs
-  • Pytest Exit Code:          0
-  • Pytest Execution Result:   990 passed in 3.22s
-  • Verified Pytest Tally:     990 passed, 0 failed
-
-Model: Gemini 4 Argon (1M Native Long Decode)
-  • Raw Output File:           raw_output_native_1m_long_decode_gemini_4_argon.txt
-  • Total Code Characters:     247,096 chars
-  • Total Emitted Files:       44 files (44 Python source files)
-  • Average Chars Per File:    5,615 chars/file
-  • AST Valid Python Files:    44/44 (100.0%)
-  • AST Functions/Methods:     594 procedures declared
-  • Lazy Placeholder Stubs:    0 stubs
-  • Pytest Exit Code:          1
-  • Pytest Execution Result:   18 failed, 202 passed, 22 warnings in 2.23s
-  • Verified Pytest Tally:     202 passed, 18 failed
-====================================================================================
+# Run tests
+python3 verify_scorecard.py --test
 ```
 
 ---
 
-## Reproducing the Live Benchmark From Scratch
+## Run History
 
-To run the live benchmark against your own API keys:
+| Run | Input | Notes |
+| :--- | :--- | :--- |
+| **Run 1** | 3 modules (16 procedures) | All models finished in 1 turn. No continuation overhead. |
+| **Run 2** | 15 modules (76 procedures) | First pagination cliff. Anthropic hit 8K ceiling 8 times (an earlier per-turn cap). |
+| **Run 3 (current)** | 22 modules (176 procedures) | Anthropic hit 64K ceiling twice. Gemini streamed 93K tokens in 1 pass. |
+
+The `archive/run_03_prior/` directory contains outputs from a dry-run (placeholder data with round token numbers like 295,000/580,000). It was a test run, not a live API call. It is preserved for completeness but excluded from analysis.
+
+---
+
+## Repository Structure
+
+```
+├── README.md                      # This document
+├── verify_scorecard.py            # No-API verification script with tests
+├── verify_artifacts.py            # Original verification script
+├── eval_long_decode_v2.py         # Benchmark harness (requires API keys)
+├── massive_legacy_sample/         # 22-module input payload
+├── new_run/                       # Definitive run: raw outputs + charts
+│   ├── raw_output_*.txt           # Committed API responses
+│   └── benchmark_*.{html,png,md}  # Visualizations
+└── archive/                       # Historical runs
+    ├── run_01_baseline/           # 3-module run
+    ├── run_02_massive/            # 15-module run
+    └── run_03_prior/              # Dry-run (placeholder data)
+```
+
+---
+
+## What This Does Not Show
+
+1. **Variance**: With n=1, we cannot say whether Gemini's 18 failed tests are typical or an outlier.
+2. **Real codebases**: The 22-module payload is synthetic.
+3. **Different prompts**: A different system prompt might change turn boundaries.
+4. **Latency**: Wall-clock time is not reported (network variability dominates).
+5. **Quality beyond tests**: The tests measure whether code runs, not whether it's idiomatic or maintainable.
+
+---
+
+## Reproducing a Live Run
+
+Requires API keys:
 
 ```bash
 export OPENAI_API_KEY="sk-..."
 export ANTHROPIC_API_KEY="sk-ant-..."
 export GEMINI_API_KEY="AIzaSy..."
 
-# Install full dependencies
 pip install google-genai openai anthropic pytest fastapi uvicorn matplotlib
 
-# Launch 3-model concurrent benchmark
 python3 eval_long_decode_v2.py \
   --input-dir ./massive_legacy_sample \
-  --target-lang "Python 3.12 (FastAPI + Pytest)" \
-  --output-dir ./my_custom_run \
+  --output-dir ./my_run \
   --provider all
 ```
 
 ---
 
-## The Multi-Run Progression: All Three Runs Preserved
+## Technical Notes
 
-To ensure total transparency, every stage of this benchmark has been preserved with its full scorecard, interactive HTML chart, and high-DPI image:
+**Anthropic's per-turn cap**: The harness uses `max_tokens=min(max_tokens, 64000)` (line 245 of `eval_long_decode_v2.py`). The column header previously said "128K" but the actual per-turn ceiling was 64K. This README and the verification script now label it correctly.
 
-| Benchmark Run | Payload Size | Key Finding | Artifact Links |
-| :--- | :--- | :--- | :--- |
-| **Run 1: Baseline Sample** | 3 modules (16 procedures) | Under 128K ceiling: all 3 models finish in 1 turn. Gemini is 5.4x cheaper than Anthropic. | • [Scorecard](archive/run_01_baseline/benchmark_results.md)<br>• [Interactive HTML](archive/run_01_baseline/benchmark_executive_chart.html)<br>• [Static PNG](archive/run_01_baseline/benchmark_executive_chart.png) |
-| **Run 2: Scaled Payload** | 15 modules (76 procedures) | First pagination cliff: Anthropic hits 8K ceiling 8x (8 turns, 15 pytest failures, $804K uncached token tax). Gemini finishes in 1 turn (35K tokens). | • [Scorecard](archive/run_02_massive/benchmark_results.md)<br>• [Interactive HTML](archive/run_02_massive/benchmark_executive_chart.html)<br>• [Static PNG](archive/run_02_massive/benchmark_executive_chart.png) |
-| **Run 3: Definitive Enterprise Run** | 22 modules (176 procedures) | Strict anti-shortcut constraints: Anthropic requires 3 turns (144K tokens, $3.56). Gemini streams 93K tokens in 1 pass ($1.31). | • [Scorecard](new_run/benchmark_results.md)<br>• [Interactive HTML](new_run/benchmark_executive_chart.html)<br>• [Static PNG](new_run/benchmark_executive_chart.png)<br>• [Raw API Outputs](new_run/) |
+**Astra's function renaming**: GPT-6 Astra renamed 4 of 8 procedure types:
+- `INIT_MODULE_XX` → `initialize`
+- `AUDIT_SECURITY_LOG_XX` → `audit`
+- `RECONCILE_MODULE_BALANCES_XX` → `reconcile`
+- `COMPUTE_FEE_SURCHARGE_XX` → `compute_surcharge`
 
----
+The verification script includes a deterministic semantic mapping to count these as matches.
 
-## Repository Structure
-
-```text
-├── README.md                      # Benchmark report & reproduction guide
-├── eval_long_decode_v2.py         # Complete async benchmark harness
-├── verify_artifacts.py            # Offline forensic verification script
-├── generate_massive_sample.py     # Parameterized legacy module generator
-├── massive_legacy_sample/         # 22-module interdependent legacy payload
-│   ├── module_00.py ... module_21.py
-├── legacy_sample/                 # 3-module baseline sample
-│   ├── user_dao.py
-│   ├── auth_service.py
-│   └── billing_batch.py
-├── new_run/                       # Definitive 22-module benchmark artifacts
-│   ├── benchmark_results.md
-│   ├── benchmark_executive_chart.png
-│   ├── benchmark_executive_chart.html
-│   ├── raw_output_128k_harness_openai_gpt-6_astra.txt
-│   ├── raw_output_128k_harness_anthropic_claude_fable.txt
-│   └── raw_output_native_1m_long_decode_gemini_4_argon.txt
-└── archive/                       # Historical prior runs
-    ├── run_01_baseline/           # 3-module initial baseline (scorecard + charts)
-    ├── run_02_massive/            # 15-module preliminary run (scorecard + charts)
-    └── run_03_prior/              # 22-module preliminary run (pre-anti-shortcut)
-```
-
----
-
-## Visual Assets
-
-- **Interactive Chart.js Dashboard:** [`new_run/benchmark_executive_chart.html`](./new_run/benchmark_executive_chart.html)
-- **High-DPI 300-DPI PNG Chart:** [`new_run/benchmark_executive_chart.png`](./new_run/benchmark_executive_chart.png)
+**Gemini's float failures**: The 18 failing tests all involve float comparison assertions like `assert 158.12 == 158.125`. These are precision mismatches in test expectations, not code generation errors.

@@ -28,7 +28,7 @@ def audit_run(run_dir: Path):
 
     models = [
         ("OpenAI GPT-6 Astra (128K Harness)", run_dir / "raw_output_128k_harness_openai_gpt-6_astra.txt"),
-        ("Anthropic Claude Fable (64K Harness)", run_dir / "raw_output_128k_harness_anthropic_claude_fable.txt"),
+        ("Anthropic Claude Fable (64K-per-turn Harness)", run_dir / "raw_output_128k_harness_anthropic_claude_fable.txt"),
         ("Gemini 4 Argon (1M Native Long Decode)", run_dir / "raw_output_native_1m_long_decode_gemini_4_argon.txt"),
     ]
 
