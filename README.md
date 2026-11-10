@@ -162,3 +162,9 @@ python3 eval_long_decode_v2.py \
 The verification script includes a deterministic semantic mapping to count these as matches.
 
 **Gemini's float failures**: The 18 failing tests all involve float comparison assertions like `assert 158.12 == 158.125`. These are precision mismatches in test expectations, not code generation errors.
+
+---
+
+## License
+
+MIT License. See [LICENSE](./LICENSE) for details.
