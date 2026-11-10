@@ -1,13 +1,24 @@
 
-## Adversarial-Grade Scorecard: Multi-Turn 128K vs. 1M Native Long Decode
+## Verified Scorecard (n=1, single run per model)
 
-| Metric | 128K Harness (OpenAI GPT-6 Astra) | 128K Harness (Anthropic Claude Fable) | Native 1M Long Decode (Gemini 4 Argon) |
+All metrics recomputed from committed raw outputs via `python3 verify_scorecard.py`.
+
+| Metric | OpenAI GPT-6 Astra (128K Harness) | Anthropic Claude Fable (64K-per-turn Harness) | Gemini 4 Argon (1M Native) |
 | :--- | :--- | :--- | :--- |
-| **1. File Completeness** | 48/44 (100%) | 44/44 (100%) | 44/44 (100%) |
-| **2. AST Function/Method Recall** | **333/176 (100%)** | **1364/176 (100%)** | **594/176 (100%)** |
-| **3. Lazy Placeholder Stubs (`TODO`/`FIXME`)** | **0 stubs** | **0 stubs** | **0 stubs** |
-| **4. Sandbox `pytest` Pass Rate** | **135/135 (100%)** | **990/990 (100%)** | **202/220 (92%)** |
-| **5. Raw Code Volume (Characters)** | 164,327 chars (~3,423/file) | 292,063 chars (~6,637/file) | 247,096 chars (~5,615/file) |
-| **6. Uncached / Cached Input Tokens** | 3 / 46,516 | 465,417 / 562 | 187,309 / 0 |
-| **7. Billed Output + Thinking Tokens** | 49,996 (1t) | 144,184 (3t) | 93,475 (1t) |
-| **8. Total Cost (With Cache Discounts)** | **$2.51** | **$3.56** | **$1.31** |
+| **1. Files Emitted (src + test)** | 23 + 23 (48 total) | 22 + 22 (44 total) | 22 + 22 (44 total) |
+| **2. Legacy Procedure Recall** | 176/176 (semantic mapping) | 176/176 | 176/176 |
+| **3. Non-test Functions** | 198 | 374 | 374 |
+| **4. Test Functions (test_*)** | 135 | 990 | 220 |
+| **5. Lazy Placeholders** | 0 | 0 | 0 |
+| **6. Pytest Pass Rate** | 135/135 (100%) | 990/990 (100%) | 202/220 (92%) |
+| **7. Raw Code Volume** | 164,327 chars | 292,063 chars | 247,096 chars |
+| **8. Uncached / Cached Input Tokens** | 3 / 46,516 | 465,417 / 562 | 187,309 / 0 |
+| **9. Output Tokens (turns)** | 49,996 (1t) | 144,184 (3t) | 93,475 (1t) |
+| **10. Cost** | $2.51 | $3.56 | $1.31 |
+
+### Notes
+
+- **n=1**: These are single-run results. Variance is not measured.
+- **Anthropic 64K-per-turn**: The harness caps per-turn output at 64K tokens (line 245: `min(max_tokens, 64000)`), not 128K.
+- **Astra semantic mapping**: GPT-6 Astra renamed 4 procedure types (`init_module`→`initialize`, etc.). Recall is verified via deterministic mapping.
+- **Gemini failures**: 18 pytest failures are float precision mismatches, not structural errors.
